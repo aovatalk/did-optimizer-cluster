@@ -1332,7 +1332,7 @@ mysqli_stmt_close($stmt);
 <input type="radio" name="diop-modal" id="modal-view-<?php echo (int)$r['did_id']; ?>" class="diop-modal-state">
 <div class="diop-modal-overlay hidden fixed inset-0 z-50 items-start justify-center pt-[6vh]">
 <label for="modal-none" class="absolute inset-0"></label>
-<div class="relative bg-white rounded-lg shadow-2xl w-[95%] max-w-3xl max-h-[86vh] overflow-y-auto p-6">
+<div class="relative bg-white rounded-lg shadow-2xl w-[96%] max-w-6xl max-h-[86vh] overflow-y-auto p-6">
 <label for="modal-none" class="absolute top-2.5 right-2.5 w-7 h-7 flex items-center justify-center rounded-full text-gray-400 hover:text-gray-700 hover:bg-gray-100 cursor-pointer text-lg">&times;</label>
 <h2 class="text-base font-semibold mb-1 pr-8">
 Calls placed using <?php echo htmlspecialchars($r['did_number']); ?>
