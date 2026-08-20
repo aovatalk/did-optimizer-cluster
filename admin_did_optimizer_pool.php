@@ -1263,6 +1263,7 @@ if ($page < $total_pages) {
 </div>
 </div>
 
+<div id="diop-row-modals">
 <?php foreach ($pool_rows as $r) { ?>
 <input type="radio" name="diop-modal" id="modal-row-<?php echo (int)$r['did_id']; ?>" class="diop-modal-state">
 <div class="diop-modal-overlay hidden fixed inset-0 z-50 items-start justify-center pt-[6vh]">
@@ -1372,6 +1373,7 @@ Calls placed using <?php echo htmlspecialchars($r['did_number']); ?>
 </div>
 </div>
 <?php } ?>
+</div>
 
 </main>
 <script>
@@ -1425,7 +1427,7 @@ diopInitBulkBar();
 	var select = document.getElementById('diop-auto-refresh');
 	var status = document.getElementById('diop-refresh-status');
 	var storageKey = 'did_optimizer_auto_refresh_seconds';
-	var timer = null, secondsLeft = 0, fragmentIds = ['diop-statsbar', 'diop-table-card', 'diop-pagination'];
+	var timer = null, secondsLeft = 0, fragmentIds = ['diop-statsbar', 'diop-table-card', 'diop-pagination', 'diop-row-modals'];
 	if (!select || !status) { return; }
 	function renderStatus(suffix) { status.textContent = secondsLeft > 0 ? 'Refresh in ' + secondsLeft + 's' + (suffix || '') : ''; }
 	// ponytail: swaps known fragments from a fetched copy of the same URL instead of a full
