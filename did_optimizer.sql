@@ -55,16 +55,30 @@ CREATE TABLE IF NOT EXISTS did_optimizer_campaign_state (
     PRIMARY KEY (campaign_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
 
--- Optional enrichment stores. Empty tables are valid: the AGI falls back to
--- VICIdial's vicidial_phone_codes data and a neutral reputation score.
+-- NANP NPA-NXX geography imported from full_dataset_csv.csv. Multiple postal
+-- codes may map to the same exchange, so the natural key includes postal code.
 CREATE TABLE IF NOT EXISTS did_optimizer_geo_prefixes (
-    npanxx CHAR(6) NOT NULL,
+    geo_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     npa CHAR(3) NOT NULL,
-    city VARCHAR(80) NOT NULL DEFAULT '',
+    nxx CHAR(3) NOT NULL,
+    npanxx CHAR(6) NOT NULL,
+    city VARCHAR(100) NOT NULL DEFAULT '',
+    state VARCHAR(100) NOT NULL DEFAULT '',
     state_iso VARCHAR(8) NOT NULL DEFAULT '',
+    country VARCHAR(100) NOT NULL DEFAULT '',
     country_iso VARCHAR(8) NOT NULL DEFAULT '',
-    PRIMARY KEY (npanxx, city, state_iso, country_iso),
-    KEY idx_didopt_geo_npa (npa, state_iso, country_iso)
+    postal_code VARCHAR(20) NOT NULL DEFAULT '',
+    gmt_offset DECIMAL(5,2) DEFAULT NULL,
+    gmt_offset_dst DECIMAL(5,2) DEFAULT NULL,
+    dst_observed TINYINT(1) NOT NULL DEFAULT 0,
+    latitude DECIMAL(10,6) DEFAULT NULL,
+    longitude DECIMAL(10,6) DEFAULT NULL,
+    PRIMARY KEY (geo_id),
+    UNIQUE KEY uq_didopt_geo_exchange_postal (npanxx, postal_code),
+    KEY idx_didopt_geo_npanxx (npanxx),
+    KEY idx_didopt_geo_npa (npa, country_iso),
+    KEY idx_didopt_geo_city_state (city, state_iso, country_iso),
+    KEY idx_didopt_geo_state (state_iso, country_iso)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS did_optimizer_reputation_cache (

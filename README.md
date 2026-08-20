@@ -77,7 +77,9 @@ Shared database schema ready (5 tables).
 ```
 
 The database role connects through the local MySQL socket. It does not require
-or discover a database IP address and does not store database credentials.
+or discover a database IP address and does not store database credentials. It
+also downloads and imports `NPA_dataset.zip` into
+`did_optimizer_geo_prefixes` for NPA-NXX, city, state, and area-code matching.
 
 ### 2. Dialer/web nodes
 
@@ -133,6 +135,10 @@ dialplan integration.
 
 The database node does not need the dialer health test. Its schema is verified
 during `sudo ./install_did_optimizer.sh --role database`.
+
+The NPA-NXX dataset is redistributed by the original DID Optimizer project
+from [djbelieny/geoinfo-dataset](https://github.com/djbelieny/geoinfo-dataset)
+under the MIT License.
 
 ## Runtime configuration
 

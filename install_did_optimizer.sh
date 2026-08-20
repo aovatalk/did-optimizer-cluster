@@ -14,6 +14,8 @@ MAINTENANCE_DIR="/usr/local/share/did-optimizer"
 ROLE=""
 CLEAN_INSTALL=0
 SOURCE_BASE_URL="${DIDOPT_SOURCE_BASE_URL:-https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main}"
+GEO_DATASET_URL="${DIDOPT_GEO_DATASET_URL:-https://raw.githubusercontent.com/aovatalk/did-optimizer/refs/heads/main/NPA_dataset.zip}"
+GEO_ZIP_SOURCE="$SCRIPT_DIR/NPA_dataset.zip"
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -24,8 +26,8 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
-download_source_file() {
-    local filename="$1" target="$SCRIPT_DIR/$1" temp_file
+download_url_file() {
+    local filename="$1" url="$2" target="$SCRIPT_DIR/$1" temp_file
     local -a curl_args=(--fail --location --silent --show-error)
     require_command curl
     require_command mktemp
@@ -35,13 +37,17 @@ download_source_file() {
     fi
     temp_file=$(mktemp "$SCRIPT_DIR/.didopt-download.XXXXXX") \
         || die "Could not create a temporary download for $filename"
-    if ! curl "${curl_args[@]}" "$SOURCE_BASE_URL/$filename" --output "$temp_file"; then
+    if ! curl "${curl_args[@]}" "$url" --output "$temp_file"; then
         rm -f -- "$temp_file"
         die "Could not download required file: $filename"
     fi
     chmod 0644 "$temp_file"
     mv -f -- "$temp_file" "$target"
     printf 'Downloaded required file: %s\n' "$target"
+}
+
+download_source_file() {
+    download_url_file "$1" "$SOURCE_BASE_URL/$1"
 }
 
 find_vicidial_path() {
@@ -82,6 +88,7 @@ done
 
 if [[ "$ROLE" == 'database' ]]; then
     download_source_file did_optimizer.sql
+    download_url_file NPA_dataset.zip "$GEO_DATASET_URL"
 else
     download_source_file did_optimizer.agi
     download_source_file admin_did_optimizer_pool.php
@@ -89,8 +96,12 @@ else
 fi
 
 install_database() {
+    local geo_csv geo_count geo_schema_ready
     require_command mysql
+    require_command unzip
+    require_command mktemp
     [[ -r "$SQL_SOURCE" ]] || die "Missing schema: $SQL_SOURCE"
+    [[ -r "$GEO_ZIP_SOURCE" ]] || die "Missing geographic dataset: $GEO_ZIP_SOURCE"
     if ((CLEAN_INSTALL)); then
         printf 'Dropping optimizer tables from shared database %s...\n' "$DB_NAME"
         mysql --protocol=socket --database="$DB_NAME" -e \
@@ -102,6 +113,52 @@ install_database() {
     fi
     printf 'Applying optimizer schema to shared database %s...\n' "$DB_NAME"
     mysql --protocol=socket --database="$DB_NAME" < "$SQL_SOURCE"
+
+    # Replace the narrow placeholder table from early cluster releases. This
+    # table contains only derived public data, so rebuilding it does not remove
+    # DID pools, assignments, or campaign state.
+    geo_schema_ready=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
+        "SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_NAME='did_optimizer_geo_prefixes'
+            AND COLUMN_NAME IN ('geo_id','nxx','postal_code','latitude','longitude');")
+    if [[ "$geo_schema_ready" != '5' ]]; then
+        printf '%s\n' 'Upgrading geographic prefix table to the full NPA-NXX schema...'
+        mysql --protocol=socket --database="$DB_NAME" -e \
+            'DROP TABLE IF EXISTS did_optimizer_geo_prefixes;'
+        mysql --protocol=socket --database="$DB_NAME" < "$SQL_SOURCE"
+    fi
+
+    geo_csv=$(mktemp /tmp/didopt-geo.XXXXXX.csv) \
+        || die 'Could not create temporary geographic CSV file.'
+    if ! unzip -p "$GEO_ZIP_SOURCE" full_dataset_csv.csv > "$geo_csv"; then
+        rm -f -- "$geo_csv"
+        die 'Could not extract full_dataset_csv.csv from NPA_dataset.zip.'
+    fi
+    [[ -s "$geo_csv" ]] || {
+        rm -f -- "$geo_csv"; die 'Extracted geographic CSV is empty.';
+    }
+    printf '%s\n' 'Refreshing NPA-NXX geographic prefix dataset...'
+    mysql --protocol=socket --database="$DB_NAME" -e \
+        'TRUNCATE TABLE did_optimizer_geo_prefixes;'
+    if ! mysql --protocol=socket --local-infile=1 --database="$DB_NAME" -e \
+        "LOAD DATA LOCAL INFILE '$geo_csv' IGNORE INTO TABLE did_optimizer_geo_prefixes
+         FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"'
+         LINES TERMINATED BY '\\n' IGNORE 1 LINES
+         (@npa,@nxx,@npanxx,@city,@state,@state_iso,@country,@country_iso,@postal,@gmt,@gmt_dst,@dst,@lat,@lon)
+         SET npa=@npa,nxx=@nxx,npanxx=@npanxx,city=@city,state=@state,state_iso=@state_iso,
+             country=@country,country_iso=@country_iso,postal_code=@postal,
+             gmt_offset=NULLIF(@gmt,''),gmt_offset_dst=NULLIF(@gmt_dst,''),
+             dst_observed=IFNULL(NULLIF(@dst,''),0),latitude=NULLIF(@lat,''),
+             longitude=NULLIF(TRIM(TRAILING '\\r' FROM @lon),'');"; then
+        rm -f -- "$geo_csv"
+        die 'NPA-NXX geographic dataset import failed.'
+    fi
+    rm -f -- "$geo_csv"
+    geo_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
+        'SELECT COUNT(*) FROM did_optimizer_geo_prefixes;')
+    [[ "$geo_count" =~ ^[0-9]+$ && "$geo_count" -gt 0 ]] \
+        || die 'NPA-NXX geographic dataset import produced no rows.'
+    printf 'Geographic prefix dataset ready (%s rows).\n' "$geo_count"
 
     # Upgrade installations made by the original three-table release.
     column_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
