@@ -23,12 +23,15 @@ first, then install the runtime files on each dialer/web node.
 ### Download with verified HTTPS (recommended)
 
 ```bash
-cd /usr/src
-curl --fail --location --silent --show-error \
-  https://github.com/aovatalk/did-optimizer-cluster/archive/refs/heads/main.tar.gz \
-  --output did-optimizer-cluster.tar.gz
-tar -xzf did-optimizer-cluster.tar.gz
-cd did-optimizer-cluster-main
+sudo mkdir -p /usr/src/did-optimizer-cluster
+cd /usr/src/did-optimizer-cluster
+base_url=https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/main
+for file in install_did_optimizer.sh did_optimizer.sql did_optimizer.agi \
+  admin_did_optimizer_pool.php quick-test.sh; do
+  sudo curl --fail --location --silent --show-error \
+    "$base_url/$file" --output "$file" || exit 1
+done
+sudo chmod 0755 install_did_optimizer.sh quick-test.sh
 ```
 
 ### Download without SSL certificate verification
@@ -36,12 +39,15 @@ cd did-optimizer-cluster-main
 Use this only when the server's CA certificates are unavailable or broken:
 
 ```bash
-cd /usr/src
-curl --insecure --fail --location --silent --show-error \
-  https://github.com/aovatalk/did-optimizer-cluster/archive/refs/heads/main.tar.gz \
-  --output did-optimizer-cluster.tar.gz
-tar -xzf did-optimizer-cluster.tar.gz
-cd did-optimizer-cluster-main
+sudo mkdir -p /usr/src/did-optimizer-cluster
+cd /usr/src/did-optimizer-cluster
+base_url=https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/main
+for file in install_did_optimizer.sh did_optimizer.sql did_optimizer.agi \
+  admin_did_optimizer_pool.php quick-test.sh; do
+  sudo curl --insecure --fail --location --silent --show-error \
+    "$base_url/$file" --output "$file" || exit 1
+done
+sudo chmod 0755 install_did_optimizer.sh quick-test.sh
 ```
 
 `--insecure` disables TLS certificate verification and can expose the download
