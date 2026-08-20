@@ -17,8 +17,9 @@ through the database node's local MySQL socket.
 
 ## Manual cluster install (recommended)
 
-Download the complete repository on every server. Install the database schema
-first, then install the runtime files on each dialer/web node.
+Download only the bootstrap installer on every server. It automatically fetches
+the files required for the selected role. Install the database schema first,
+then install the runtime files on each dialer/web node.
 
 ### Download with verified HTTPS (recommended)
 
@@ -28,13 +29,7 @@ cd /usr/src/did-optimizer-cluster
 sudo curl --fail --location --silent --show-error \
   https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main/install_did_optimizer.sh \
   --output install_did_optimizer.sh
-base_url=https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main
-for file in did_optimizer.sql did_optimizer.agi admin_did_optimizer_pool.php \
-  quick-test.sh; do
-  sudo curl --fail --location --silent --show-error \
-    "$base_url/$file" --output "$file" || exit 1
-done
-sudo chmod 0755 install_did_optimizer.sh quick-test.sh
+sudo chmod 0755 install_did_optimizer.sh
 ```
 
 ### Download without SSL certificate verification
@@ -47,19 +42,26 @@ cd /usr/src/did-optimizer-cluster
 sudo curl --insecure --fail --location --silent --show-error \
   https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main/install_did_optimizer.sh \
   --output install_did_optimizer.sh
-base_url=https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main
-for file in did_optimizer.sql did_optimizer.agi admin_did_optimizer_pool.php \
-  quick-test.sh; do
-  sudo curl --insecure --fail --location --silent --show-error \
-    "$base_url/$file" --output "$file" || exit 1
-done
-sudo chmod 0755 install_did_optimizer.sh quick-test.sh
+sudo chmod 0755 install_did_optimizer.sh
 ```
 
 `--insecure` disables TLS certificate verification and can expose the download
 to interception or modification. Repairing the server's CA trust and using the
 verified HTTPS command is strongly preferred. GitHub redirects plain HTTP to
 HTTPS, so an HTTP URL is not a true non-SSL download method.
+
+When CA verification is unavailable, pass `DIDOPT_CURL_INSECURE=1` to the
+installer so its role-specific file downloads use the same fallback:
+
+```bash
+sudo DIDOPT_CURL_INSECURE=1 ./install_did_optimizer.sh --role database
+```
+
+or, on a dialer/web node:
+
+```bash
+sudo DIDOPT_CURL_INSECURE=1 ./install_did_optimizer.sh --role dialer
+```
 
 ### 1. Database node
 

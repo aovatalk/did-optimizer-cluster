@@ -13,6 +13,7 @@ AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
 MAINTENANCE_DIR="/usr/local/share/did-optimizer"
 ROLE=""
 CLEAN_INSTALL=0
+SOURCE_BASE_URL="${DIDOPT_SOURCE_BASE_URL:-https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main}"
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -21,6 +22,26 @@ die() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+download_source_file() {
+    local filename="$1" target="$SCRIPT_DIR/$1" temp_file
+    local -a curl_args=(--fail --location --silent --show-error)
+    require_command curl
+    require_command mktemp
+    if [[ "${DIDOPT_CURL_INSECURE:-0}" =~ ^(1|Y|y|YES|yes|true|TRUE)$ ]]; then
+        curl_args+=(--insecure)
+        printf 'WARNING: downloading %s without TLS certificate verification.\n' "$filename" >&2
+    fi
+    temp_file=$(mktemp "$SCRIPT_DIR/.didopt-download.XXXXXX") \
+        || die "Could not create a temporary download for $filename"
+    if ! curl "${curl_args[@]}" "$SOURCE_BASE_URL/$filename" --output "$temp_file"; then
+        rm -f -- "$temp_file"
+        die "Could not download required file: $filename"
+    fi
+    chmod 0644 "$temp_file"
+    mv -f -- "$temp_file" "$target"
+    printf 'Downloaded required file: %s\n' "$target"
 }
 
 find_vicidial_path() {
@@ -58,6 +79,14 @@ done
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die 'Run this installer as root.'
 [[ "$ROLE" == 'database' || "$CLEAN_INSTALL" == '0' ]] \
     || die '--clean is valid only with --role database.'
+
+if [[ "$ROLE" == 'database' ]]; then
+    download_source_file did_optimizer.sql
+else
+    download_source_file did_optimizer.agi
+    download_source_file admin_did_optimizer_pool.php
+    download_source_file quick-test.sh
+fi
 
 install_database() {
     require_command mysql
