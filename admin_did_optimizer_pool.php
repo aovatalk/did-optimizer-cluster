@@ -580,11 +580,10 @@ $sort_map = array(
 	'last_used'   => 'p.last_used',
 	'reputation'  => 'rc.reputation',
 );
-$sort_key = isset($_GET['sort']) && isset($sort_map[$_GET['sort']]) ? $_GET['sort'] : '';
-$sort_dir = (isset($_GET['dir']) && $_GET['dir'] == 'desc') ? 'desc' : 'asc';
-$order_by = $sort_key
-	? ($sort_map[$sort_key] . ' ' . $sort_dir . ', did_id ' . $sort_dir)
-	: 'p.campaign_id, p.local_key, p.did_number';
+# Default view (no explicit sort clicked) is calls-today descending, so the busiest DIDs surface first.
+$sort_key = isset($_GET['sort']) && isset($sort_map[$_GET['sort']]) ? $_GET['sort'] : 'calls_today';
+$sort_dir = isset($_GET['dir']) ? (($_GET['dir'] == 'asc') ? 'asc' : 'desc') : 'desc';
+$order_by = $sort_map[$sort_key] . ' ' . $sort_dir . ', did_id ' . $sort_dir;
 
 $per_page = 25;
 $page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
