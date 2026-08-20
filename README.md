@@ -26,9 +26,8 @@ then install the runtime files on each dialer/web node.
 ```bash
 sudo mkdir -p /usr/src/did-optimizer-cluster
 cd /usr/src/did-optimizer-cluster
-sudo curl --fail --location --silent --show-error \
-  https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main/install_did_optimizer.sh \
-  --output install_did_optimizer.sh
+sudo curl -fLO \
+  https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main/install_did_optimizer.sh
 sudo chmod 0755 install_did_optimizer.sh
 ```
 
@@ -39,9 +38,8 @@ Use this only when the server's CA certificates are unavailable or broken:
 ```bash
 sudo mkdir -p /usr/src/did-optimizer-cluster
 cd /usr/src/did-optimizer-cluster
-sudo curl --insecure --fail --location --silent --show-error \
-  https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main/install_did_optimizer.sh \
-  --output install_did_optimizer.sh
+sudo curl -kfLO \
+  https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main/install_did_optimizer.sh
 sudo chmod 0755 install_did_optimizer.sh
 ```
 
