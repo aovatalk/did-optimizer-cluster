@@ -1433,6 +1433,8 @@ diopInitBulkBar();
 	// ponytail: swaps known fragments from a fetched copy of the same URL instead of a full
 	// navigation - reuses the existing PHP rendering, no JSON API to keep in sync separately.
 	function ajaxRefresh() {
+		var openModal = document.querySelector('input[name="diop-modal"]:checked');
+		var openModalId = (openModal && openModal.id !== 'modal-none') ? openModal.id : null;
 		fetch(window.location.pathname + window.location.search, { credentials: 'same-origin' })
 			.then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.text(); })
 			.then(function (html) {
@@ -1442,6 +1444,12 @@ diopInitBulkBar();
 					if (next && current) { current.replaceWith(next); }
 				});
 				diopInitBulkBar();
+				// Re-check whichever row modal (Edit / View calls) was open before the swap,
+				// now pointing at the freshly-fetched radio+overlay so it keeps showing current data.
+				if (openModalId) {
+					var stillThere = document.getElementById(openModalId);
+					if (stillThere) { stillThere.checked = true; }
+				}
 			})
 			.catch(function () { renderStatus(' (failed, retrying next cycle)'); });
 	}
