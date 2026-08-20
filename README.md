@@ -25,9 +25,12 @@ first, then install the runtime files on each dialer/web node.
 ```bash
 sudo mkdir -p /usr/src/did-optimizer-cluster
 cd /usr/src/did-optimizer-cluster
-base_url=https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/main
-for file in install_did_optimizer.sh did_optimizer.sql did_optimizer.agi \
-  admin_did_optimizer_pool.php quick-test.sh; do
+sudo curl --fail --location --silent --show-error \
+  https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main/install_did_optimizer.sh \
+  --output install_did_optimizer.sh
+base_url=https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main
+for file in did_optimizer.sql did_optimizer.agi admin_did_optimizer_pool.php \
+  quick-test.sh; do
   sudo curl --fail --location --silent --show-error \
     "$base_url/$file" --output "$file" || exit 1
 done
@@ -41,9 +44,12 @@ Use this only when the server's CA certificates are unavailable or broken:
 ```bash
 sudo mkdir -p /usr/src/did-optimizer-cluster
 cd /usr/src/did-optimizer-cluster
-base_url=https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/main
-for file in install_did_optimizer.sh did_optimizer.sql did_optimizer.agi \
-  admin_did_optimizer_pool.php quick-test.sh; do
+sudo curl --insecure --fail --location --silent --show-error \
+  https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main/install_did_optimizer.sh \
+  --output install_did_optimizer.sh
+base_url=https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main
+for file in did_optimizer.sql did_optimizer.agi admin_did_optimizer_pool.php \
+  quick-test.sh; do
   sudo curl --insecure --fail --location --silent --show-error \
     "$base_url/$file" --output "$file" || exit 1
 done
