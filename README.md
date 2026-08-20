@@ -110,9 +110,20 @@ The cluster-compatible VICIdial admin page provides:
 - simple all-DID import with no area-code filtering or import quantity limit;
 - campaign-wide and per-DID daily limits;
 - reputation filtering and cached provider results;
+- Bayesian DID performance scores using recent call outcomes, duration, and
+  reputation;
 - cluster-node visibility for assignment history;
 - browser-persisted automatic refresh intervals; and
 - dismissible success and error toast notifications.
+
+### Completed-call correlation
+
+Call history and the PHP Bayesian score first match an optimizer assignment to
+`vicidial_log` by exact call `uniqueid`. VICIdial can write the completed call
+under a different Asterisk channel-leg ID, so unmatched assignments fall back
+to the same campaign, lead, destination, and closest call time within a bounded
+window. A row is shown as pending only when neither correlation finds a
+completed log record.
 
 ### Reputation configuration
 

@@ -182,6 +182,134 @@ function diop_load_reputations($link, $numbers)
 	return $results;
 	}
 
+function diop_exact_log_match_sql()
+	{
+	return "v.uniqueid = a.unique_call_id AND v.campaign_id = a.campaign_id";
+	}
+
+function diop_fallback_log_match_sql()
+	{
+	return "a.lead_id IS NOT NULL
+		AND v.lead_id = a.lead_id
+		AND v.campaign_id = a.campaign_id
+		AND RIGHT(v.phone_number, 10) = RIGHT(a.destination, 10)
+		AND v.call_date BETWEEN a.assigned_at - INTERVAL 2 MINUTE
+		                    AND a.assigned_at + INTERVAL 30 MINUTE";
+	}
+
+function diop_fallback_log_order_sql()
+	{
+	return "ABS(TIMESTAMPDIFF(SECOND, a.assigned_at, v.call_date)),
+		v.call_date DESC, v.uniqueid DESC";
+	}
+
+function diop_calculate_performance_scores($link, $visible_rows)
+	{
+	$scores = array();
+	$candidates = array();
+	foreach ($visible_rows as $row)
+		{
+		if ($row['enabled'] != 'Y') {continue;}
+		$rep = isset($row['reputation_data']['reputation']) ? $row['reputation_data']['reputation'] : null;
+		$candidates[] = array(
+			'did_number' => $row['did_number'],
+			'campaign_id' => $row['campaign_id'],
+			'reputation' => $rep
+		);
+		}
+	if (!count($candidates)) {return $scores;}
+
+	$stats = array();
+	$totals = array();
+	$exact_match = diop_exact_log_match_sql();
+	$fallback_match = diop_fallback_log_match_sql();
+	$fallback_order = diop_fallback_log_order_sql();
+	$stmt = mysqli_prepare($link,
+		"SELECT mapped.duration,
+		        COALESCE(
+		          (SELECT vcs.human_answered FROM vicidial_campaign_statuses vcs
+		            WHERE vcs.campaign_id=mapped.campaign_id AND vcs.status=mapped.status LIMIT 1),
+		          (SELECT vs.human_answered FROM vicidial_statuses vs
+		            WHERE vs.status=mapped.status LIMIT 1), 'N') AS human_answered
+		   FROM (
+		        SELECT a.campaign_id, a.assignment_id, a.assigned_at,
+		               COALESCE(
+		                 (SELECT v.status FROM vicidial_log v WHERE $exact_match LIMIT 1),
+		                 (SELECT v.status FROM vicidial_log v
+		                   WHERE $fallback_match ORDER BY $fallback_order LIMIT 1)
+		               ) AS status,
+		               COALESCE(
+		                 (SELECT v.length_in_sec FROM vicidial_log v WHERE $exact_match LIMIT 1),
+		                 (SELECT v.length_in_sec FROM vicidial_log v
+		                   WHERE $fallback_match ORDER BY $fallback_order LIMIT 1), 0
+		               ) AS duration
+		          FROM did_optimizer_assignments a
+		         WHERE a.campaign_id=? AND a.did_number=? AND a.callerid_applied='Y'
+		           AND (EXISTS (SELECT 1 FROM vicidial_log v WHERE $exact_match)
+		                OR EXISTS (SELECT 1 FROM vicidial_log v WHERE $fallback_match))
+		         ORDER BY a.assigned_at DESC, a.assignment_id DESC
+		         LIMIT 20
+		   ) mapped
+		  ORDER BY mapped.assigned_at DESC, mapped.assignment_id DESC");
+	foreach ($candidates as $candidate)
+		{
+		$campaign = $candidate['campaign_id'];
+		$did = $candidate['did_number'];
+		mysqli_stmt_bind_param($stmt, 'ss', $campaign, $did);
+		mysqli_stmt_execute($stmt);
+		$res = mysqli_stmt_get_result($stmt);
+		$sample = 0; $human = 0; $good = 0; $seconds = 0;
+		while ($call = mysqli_fetch_assoc($res))
+			{
+			$sample++;
+			if ($call['human_answered'] == 'Y')
+				{
+				$human++;
+				$seconds += (int)$call['duration'];
+				if ((int)$call['duration'] > 5) {$good++;}
+				}
+			}
+		$key = $campaign . '|' . $did;
+		$stats[$key] = array('sample'=>$sample, 'human'=>$human, 'good'=>$good, 'seconds'=>$seconds);
+		if (!isset($totals[$campaign]))
+			{$totals[$campaign] = array('sample'=>0, 'human'=>0, 'good'=>0, 'seconds'=>0);}
+		$totals[$campaign]['sample'] += $sample;
+		$totals[$campaign]['human'] += $human;
+		$totals[$campaign]['good'] += $good;
+		$totals[$campaign]['seconds'] += $seconds;
+		}
+	mysqli_stmt_close($stmt);
+
+	foreach ($candidates as $candidate)
+		{
+		$campaign = $candidate['campaign_id'];
+		$key = $campaign . '|' . $candidate['did_number'];
+		$stat = $stats[$key];
+		$total = $totals[$campaign];
+		$prior_good = $total['sample'] ? $total['good'] / $total['sample'] : 0.50;
+		$prior_human = $total['sample'] ? $total['human'] / $total['sample'] : 0.50;
+		$prior_duration = $total['human'] ? $total['seconds'] / $total['human'] : 30;
+		$smoothed_good = ($stat['good'] + 5 * $prior_good) / ($stat['sample'] + 5);
+		$smoothed_human = ($stat['human'] + 5 * $prior_human) / ($stat['sample'] + 5);
+		$smoothed_duration = ($stat['seconds'] + 5 * $prior_duration) / ($stat['human'] + 5);
+		$duration_component = min(1, $smoothed_duration / 120);
+		$reputation_name = isset($candidate['reputation']) ? $candidate['reputation'] : 'Unknown';
+		$reputation_lower = strtolower($reputation_name);
+		$reputation_component = ($reputation_lower == 'positive') ? 1
+			: (($reputation_lower == 'negative') ? 0 : 0.50);
+		$scores[$key] = array(
+			'score' => 0.40 * $smoothed_good + 0.24 * $smoothed_human
+				+ 0.16 * $duration_component + 0.20 * $reputation_component,
+			'sample' => $stat['sample'],
+			'good_rate' => $smoothed_good,
+			'human_rate' => $smoothed_human,
+			'duration' => $smoothed_duration,
+			'reputation' => $reputation_name
+		);
+		}
+	return $scores;
+	}
+
 $action = isset($_POST['action']) ? $_POST['action'] : '';
 $message = '';
 $message_class = 'diop-ok';
@@ -444,6 +572,13 @@ foreach ($pool_rows as $idx => $row)
 	$digits = preg_replace('/\D/', '', $row['did_number']);
 	$pool_rows[$idx]['reputation_data'] = isset($page_reputations[$digits]) ? $page_reputations[$digits] : null;
 	}
+$page_performance = diop_calculate_performance_scores($link, $pool_rows);
+foreach ($pool_rows as $idx => $row)
+	{
+	$performance_key = $row['campaign_id'] . '|' . $row['did_number'];
+	$pool_rows[$idx]['performance_data'] = isset($page_performance[$performance_key])
+		? $page_performance[$performance_key] : null;
+	}
 $reputation_config = diop_reputation_config($link);
 $shared_settings = diop_shared_settings($link);
 
@@ -516,7 +651,7 @@ body.diop-body {
 .diop-filter-card, .diop-table-card { background: white; border: 1px solid var(--line); border-radius: 1rem; box-shadow: 0 5px 22px rgba(24,35,66,.045); }
 .diop-filter-card { padding: 1rem; margin-bottom: .85rem; }
 .diop-table-card { overflow: auto; }
-.diop-table-card table { border-collapse: separate; border-spacing: 0; min-width: 920px; }
+.diop-table-card table { border-collapse: separate; border-spacing: 0; min-width: 1040px; }
 .diop-table-card thead th { position: sticky; top: 0; z-index: 1; background: #f8fafc; border-bottom: 1px solid var(--line); }
 .diop-table-card tbody tr { transition: background .12s ease; }
 .diop-table-card tbody tr:hover { background: #f5f8ff; }
@@ -853,6 +988,7 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'DID','did',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Campaign','campaign',$sort_key,$sort_dir,$qs_base); ?></th><th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Status','status',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Reputation','reputation',$sort_key,$sort_dir,$qs_base); ?></th>
+<th class="px-3 py-2 text-left">Bayesian Score</th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Priority','priority',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Daily Limit','limit',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Calls Today','calls_today',$sort_key,$sort_dir,$qs_base); ?></th>
@@ -863,7 +999,7 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 </thead>
 <tbody class="divide-y divide-gray-100">
 <?php if (count($pool_rows) == 0) { ?>
-<tr><td colspan="10" class="diop-empty"><strong>No DIDs found</strong>Adjust the filters or add inventory to this pool.</td></tr>
+<tr><td colspan="11" class="diop-empty"><strong>No DIDs found</strong>Adjust the filters or add inventory to this pool.</td></tr>
 <?php } ?>
 <?php foreach ($pool_rows as $r) {
 	$row_bg = ($r['enabled']=='N') ? 'bg-gray-50 text-gray-400' : '';
@@ -888,6 +1024,21 @@ else
 		: (($rep_lower == 'negative') ? 'text-red-700 bg-red-100' : 'text-gray-600 bg-gray-100');
 	$title = !empty($rep['lookup_error']) ? $rep['lookup_error'] : ('Checked '.$rep['checked_at']);
 	echo '<span title="'.htmlspecialchars($title).'" class="inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold '.$rep_class.'">'.htmlspecialchars($rep_name).'</span>';
+	}
+?>
+</td>
+<td class="px-3 py-2">
+<?php
+$perf = isset($r['performance_data']) ? $r['performance_data'] : null;
+if (!$perf)
+	{echo '<span class="text-gray-300">&mdash;</span>';}
+else
+	{
+	$score_pct = number_format($perf['score'] * 100, 1);
+	$title = sprintf('Sample %d | Success %.1f%% | Human %.1f%% | Duration %.1fs | Reputation %s',
+		$perf['sample'], $perf['good_rate'] * 100, $perf['human_rate'] * 100,
+		$perf['duration'], $perf['reputation']);
+	echo '<span title="'.htmlspecialchars($title).'" class="font-semibold text-blue-700">'.$score_pct.'%</span>';
 	}
 ?>
 </td>
@@ -996,11 +1147,22 @@ if ($page < $total_pages) {
 
 <?php
 $calls = array();
+$exact_match = diop_exact_log_match_sql();
+$fallback_match = diop_fallback_log_match_sql();
+$fallback_order = diop_fallback_log_order_sql();
 $stmt = mysqli_prepare($link,
 	"SELECT a.unique_call_id, a.server_ip, a.lead_id, a.destination, a.selection_reason, a.callerid_applied, a.assigned_at,
-	        v.status, v.length_in_sec
+	        COALESCE(
+	          (SELECT v.status FROM vicidial_log v WHERE $exact_match LIMIT 1),
+	          (SELECT v.status FROM vicidial_log v
+	            WHERE $fallback_match ORDER BY $fallback_order LIMIT 1)
+	        ) AS status,
+	        COALESCE(
+	          (SELECT v.length_in_sec FROM vicidial_log v WHERE $exact_match LIMIT 1),
+	          (SELECT v.length_in_sec FROM vicidial_log v
+	            WHERE $fallback_match ORDER BY $fallback_order LIMIT 1)
+	        ) AS length_in_sec
 	   FROM did_optimizer_assignments a
-	   LEFT JOIN vicidial_log v ON v.uniqueid = a.unique_call_id AND v.campaign_id = a.campaign_id
 	  WHERE a.did_number = ? AND a.campaign_id = ?
 	  ORDER BY a.assigned_at DESC
 	  LIMIT 100;");
