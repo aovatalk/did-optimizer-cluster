@@ -1128,7 +1128,7 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'DID','did',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Campaign','campaign',$sort_key,$sort_dir,$qs_base); ?></th><th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Status','status',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Reputation','reputation',$sort_key,$sort_dir,$qs_base); ?></th>
-<th class="px-3 py-2 text-left">Bayesian Score</th>
+<th class="px-3 py-2 text-left">Score</th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Priority','priority',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Daily Limit','limit',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Calls Today','calls_today',$sort_key,$sort_dir,$qs_base); ?></th>
@@ -1168,7 +1168,7 @@ else
 	}
 ?>
 </td>
-<td class="px-3 py-2" data-label="Bayesian Score">
+<td class="px-3 py-2" data-label="Score">
 <?php
 $perf = isset($r['performance_data']) ? $r['performance_data'] : null;
 if (!$perf)
