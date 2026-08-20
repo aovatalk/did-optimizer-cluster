@@ -694,9 +694,7 @@ body.diop-body {
 /* Plain top bar: title only, no banner chrome */
 .diop-topbar { background: var(--surface); border-bottom: 1px solid var(--line); }
 .diop-topbar-inner { max-width: 80rem; margin: auto; padding: 1.1rem 1.5rem; }
-.diop-eyebrow { font-size: .66rem; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); font-weight: 700; }
-.diop-title { margin: .2rem 0 0; font-size: 1.5rem; font-weight: 700; color: var(--ink); letter-spacing: -.01em; }
-.diop-subtitle { margin-top: .25rem; color: var(--muted); font-size: .78rem; }
+.diop-title { margin: 0; font-size: 1.5rem; font-weight: 700; color: var(--ink); letter-spacing: -.01em; }
 
 .diop-shell { max-width: 80rem; margin: 0 auto; padding: 1.4rem 1.5rem 3rem; position: relative; z-index: 2; }
 
@@ -813,9 +811,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent) !importan
 
 <header class="diop-topbar">
 <div class="diop-topbar-inner">
-<div class="diop-eyebrow">Outbound identity operations</div>
 <h1 class="diop-title diop-display">DID Optimizer</h1>
-<div class="diop-subtitle">Control local-presence inventory, traffic limits, and caller-ID performance from one workspace.</div>
 </div>
 </header>
 
