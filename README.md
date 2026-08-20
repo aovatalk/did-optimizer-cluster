@@ -17,8 +17,37 @@ through the database node's local MySQL socket.
 
 ## Manual cluster install (recommended)
 
-Copy the complete repository to every server. Install the database schema first,
-then install the runtime files on each dialer/web node.
+Download the complete repository on every server. Install the database schema
+first, then install the runtime files on each dialer/web node.
+
+### Download with verified HTTPS (recommended)
+
+```bash
+cd /usr/src
+curl --fail --location --silent --show-error \
+  https://github.com/aovatalk/did-optimizer-cluster/archive/refs/heads/main.tar.gz \
+  --output did-optimizer-cluster.tar.gz
+tar -xzf did-optimizer-cluster.tar.gz
+cd did-optimizer-cluster-main
+```
+
+### Download without SSL certificate verification
+
+Use this only when the server's CA certificates are unavailable or broken:
+
+```bash
+cd /usr/src
+curl --insecure --fail --location --silent --show-error \
+  https://github.com/aovatalk/did-optimizer-cluster/archive/refs/heads/main.tar.gz \
+  --output did-optimizer-cluster.tar.gz
+tar -xzf did-optimizer-cluster.tar.gz
+cd did-optimizer-cluster-main
+```
+
+`--insecure` disables TLS certificate verification and can expose the download
+to interception or modification. Repairing the server's CA trust and using the
+verified HTTPS command is strongly preferred. GitHub redirects plain HTTP to
+HTTPS, so an HTTP URL is not a true non-SSL download method.
 
 ### 1. Database node
 
