@@ -182,10 +182,25 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments','did_optimizer_campaign_state',
               'did_optimizer_geo_prefixes','did_optimizer_reputation_cache')
-            AND ENGINE='InnoDB' AND TABLE_COLLATION='utf8_unicode_ci';" 2>/dev/null)
+            AND ENGINE='InnoDB'
+            AND TABLE_COLLATION IN ('utf8_unicode_ci','utf8mb3_unicode_ci');" 2>/dev/null)
     [[ "$engine_count" == '5' ]] \
-        && pass 'all optimizer tables use InnoDB and utf8_unicode_ci' \
-        || fail 'one or more optimizer tables has the wrong engine or collation'
+        && pass 'all optimizer tables use InnoDB and a compatible utf8 Unicode collation' \
+        || {
+            fail 'one or more optimizer tables has the wrong engine or collation'
+            table_storage_details=$(mysql_db --batch --skip-column-names -e \
+                "SELECT CONCAT(TABLE_NAME, ': engine=', COALESCE(ENGINE,'NULL'),
+                               ' collation=', COALESCE(TABLE_COLLATION,'NULL'))
+                   FROM information_schema.TABLES
+                  WHERE TABLE_SCHEMA='$DB_NAME'
+                    AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments',
+                      'did_optimizer_campaign_state','did_optimizer_geo_prefixes',
+                      'did_optimizer_reputation_cache')
+                  ORDER BY TABLE_NAME;" 2>/dev/null || true)
+            while IFS= read -r storage_line; do
+                [[ -n "$storage_line" ]] && warn "$storage_line"
+            done <<< "$table_storage_details"
+        }
 
     index_count=$(mysql_db --batch --skip-column-names -e \
         "SELECT COUNT(DISTINCT TABLE_NAME, INDEX_NAME)
