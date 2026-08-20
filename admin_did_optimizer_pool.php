@@ -822,7 +822,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent) !importan
 
 <main class="diop-shell">
 
-<section class="diop-statsbar" aria-label="Pool summary">
+<section id="diop-statsbar" class="diop-statsbar" aria-label="Pool summary">
 <div class="diop-topbar-stat" title="<?php echo $total_enabled; ?> enabled in current view"><span class="diop-topbar-stat-value diop-display"><?php echo $total_pool; ?></span><span class="diop-topbar-stat-label">DIDs</span></div>
 <div class="diop-topbar-stat" title="Across filtered DIDs"><span class="diop-topbar-stat-value diop-display"><?php echo $total_calls_today; ?></span><span class="diop-topbar-stat-label">Calls today</span></div>
 <div class="diop-topbar-stat" title="Lifetime optimizer selections"><span class="diop-topbar-stat-value diop-display"><?php echo $total_assignments_sum; ?></span><span class="diop-topbar-stat-label">Assignments</span></div>
@@ -1125,7 +1125,7 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 </span>
 <button type="button" data-op="delete" class="diop-bulk-danger">Delete</button>
 </div>
-<div class="diop-table-card">
+<div id="diop-table-card" class="diop-table-card">
 <table class="w-full text-xs">
 <thead>
 <tr class="bg-gray-50 text-gray-500 uppercase text-[11px] tracking-wide">
@@ -1195,7 +1195,14 @@ else
 </td>
 <td class="px-3 py-2" data-label="Priority"><?php echo (int)$r['admin_priority']; ?></td>
 <td class="px-3 py-2" data-label="Daily Limit"><?php echo (int)$r['daily_limit']; ?></td>
-<td class="px-3 py-2" data-label="Calls Today"><?php echo (int)$r['calls_today_effective']; ?></td>
+<td class="px-3 py-2" data-label="Calls Today">
+<?php
+$at_cap = $r['daily_limit'] > 0 && $r['calls_today_effective'] >= $r['daily_limit'];
+echo (int)$r['calls_today_effective'];
+if ($at_cap)
+	{echo ' <span title="Reached today\'s daily limit - excluded from selection until it resets at midnight" class="inline-block px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-amber-100 text-amber-700">capped</span>';}
+?>
+</td>
 <td class="px-3 py-2" data-label="Total"><?php echo (int)$r['total_assignments']; ?></td>
 <td class="px-3 py-2" data-label="Last Used"><?php echo htmlspecialchars($r['last_used'] ? $r['last_used'] : '-'); ?></td>
 <td class="px-3 py-2" data-label="Actions">
@@ -1232,7 +1239,7 @@ else
 </table>
 </div>
 
-<div class="flex items-center justify-between mt-3 text-xs text-gray-500">
+<div id="diop-pagination" class="flex items-center justify-between mt-3 text-xs text-gray-500">
 <div>Page <?php echo $page; ?> of <?php echo $total_pages; ?> (<?php echo $total_filtered; ?> total)</div>
 <div class="flex items-center gap-1">
 <?php
@@ -1373,35 +1380,7 @@ Calls placed using <?php echo htmlspecialchars($r['did_number']); ?>
 
 </main>
 <script>
-(function () {
-	var select = document.getElementById('diop-auto-refresh');
-	var status = document.getElementById('diop-refresh-status');
-	var storageKey = 'did_optimizer_auto_refresh_seconds';
-	var timer = null, secondsLeft = 0;
-	if (!select || !status) { return; }
-	function renderStatus() { status.textContent = secondsLeft > 0 ? 'Refresh in ' + secondsLeft + 's' : ''; }
-	function startRefresh(seconds) {
-		if (timer !== null) { window.clearInterval(timer); timer = null; }
-		secondsLeft = seconds; renderStatus();
-		if (seconds < 1) { return; }
-		timer = window.setInterval(function () {
-			secondsLeft--;
-			if (secondsLeft <= 0) { window.location.assign(window.location.pathname + window.location.search); return; }
-			renderStatus();
-		}, 1000);
-	}
-	var saved = '0';
-	try { saved = window.localStorage.getItem(storageKey) || '0'; } catch (ignore) {}
-	if (!select.querySelector('option[value="' + saved + '"]')) { saved = '0'; }
-	select.value = saved; startRefresh(parseInt(saved, 10) || 0);
-	select.onchange = function () {
-		var seconds = parseInt(select.value, 10) || 0;
-		try { window.localStorage.setItem(storageKey, String(seconds)); } catch (ignore) {}
-		startRefresh(seconds);
-	};
-}());
-
-(function () {
+function diopInitBulkBar() {
 	var bar = document.getElementById('diop-bulkbar');
 	var countEl = document.getElementById('diop-bulk-count');
 	var selectAll = document.getElementById('diop-select-all');
@@ -1444,6 +1423,50 @@ Calls placed using <?php echo htmlspecialchars($r['did_number']); ?>
 			document.getElementById('diop-bulk-form').submit();
 		});
 	});
+}
+diopInitBulkBar();
+
+(function () {
+	var select = document.getElementById('diop-auto-refresh');
+	var status = document.getElementById('diop-refresh-status');
+	var storageKey = 'did_optimizer_auto_refresh_seconds';
+	var timer = null, secondsLeft = 0, fragmentIds = ['diop-statsbar', 'diop-table-card', 'diop-pagination'];
+	if (!select || !status) { return; }
+	function renderStatus(suffix) { status.textContent = secondsLeft > 0 ? 'Refresh in ' + secondsLeft + 's' + (suffix || '') : ''; }
+	// ponytail: swaps known fragments from a fetched copy of the same URL instead of a full
+	// navigation - reuses the existing PHP rendering, no JSON API to keep in sync separately.
+	function ajaxRefresh() {
+		fetch(window.location.pathname + window.location.search, { credentials: 'same-origin' })
+			.then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.text(); })
+			.then(function (html) {
+				var doc = new DOMParser().parseFromString(html, 'text/html');
+				fragmentIds.forEach(function (id) {
+					var next = doc.getElementById(id), current = document.getElementById(id);
+					if (next && current) { current.replaceWith(next); }
+				});
+				diopInitBulkBar();
+			})
+			.catch(function () { renderStatus(' (failed, retrying next cycle)'); });
+	}
+	function startRefresh(seconds) {
+		if (timer !== null) { window.clearInterval(timer); timer = null; }
+		secondsLeft = seconds; renderStatus();
+		if (seconds < 1) { return; }
+		timer = window.setInterval(function () {
+			secondsLeft--;
+			if (secondsLeft <= 0) { ajaxRefresh(); secondsLeft = seconds; }
+			renderStatus();
+		}, 1000);
+	}
+	var saved = '0';
+	try { saved = window.localStorage.getItem(storageKey) || '0'; } catch (ignore) {}
+	if (!select.querySelector('option[value="' + saved + '"]')) { saved = '0'; }
+	select.value = saved; startRefresh(parseInt(saved, 10) || 0);
+	select.onchange = function () {
+		var seconds = parseInt(select.value, 10) || 0;
+		try { window.localStorage.setItem(storageKey, String(seconds)); } catch (ignore) {}
+		startRefresh(seconds);
+	};
 }());
 
 function diopDismissToast() {
