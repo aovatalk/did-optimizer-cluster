@@ -292,7 +292,7 @@ function diop_calculate_performance_scores($link, $visible_rows)
 		$smoothed_good = ($stat['good'] + 5 * $prior_good) / ($stat['sample'] + 5);
 		$smoothed_human = ($stat['human'] + 5 * $prior_human) / ($stat['sample'] + 5);
 		$smoothed_duration = ($stat['seconds'] + 5 * $prior_duration) / ($stat['human'] + 5);
-		$duration_component = min(1, $smoothed_duration / 120);
+		$duration_component = min(1, $smoothed_duration / 30);
 		$reputation_name = isset($candidate['reputation']) ? $candidate['reputation'] : 'Unknown';
 		$reputation_lower = strtolower($reputation_name);
 		$reputation_component = ($reputation_lower == 'positive') ? 1
