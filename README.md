@@ -105,8 +105,9 @@ nodes read `VARserver_ip` and all `VARDB_*` settings from their existing
 The cluster-compatible VICIdial admin page provides:
 
 - single and CSV DID imports;
-- full synchronization of all available `vicidial_inbound_dids` inventory;
-- optional advanced synchronization limited by area codes and DIDs per area;
+- full synchronization of outbound DIDs from a selected VICIdial CID group
+  (`vicidial_campaign_cid_areacodes`), defaulting to `NORMAL`;
+- simple all-DID import with no area-code filtering or import quantity limit;
 - campaign-wide and per-DID daily limits;
 - reputation filtering and cached provider results;
 - cluster-node visibility for assignment history;

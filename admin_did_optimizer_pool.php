@@ -8,15 +8,14 @@
 # Requires full admin login (vicidial_users, user_level > 7), same
 # authorization mechanism used by admin.php.
 #
-# Features: add single DID, bulk-add via CSV upload, sync DIDs directly from
-# VICIdial's own vicidial_inbound_dids table (spread across area codes).
+# Features: add single DID, bulk-add via CSV upload, and sync outbound DIDs
+# directly from a VICIdial CID group (spread across area codes).
 
 require("dbconnect_mysqli.php");
 require("functions.php");
 
 # Match did_optimizer_pool / vicidial_* table collation (utf8_unicode_ci) so
-# comparisons and joins against vicidial_inbound_dids don't hit "Illegal mix
-# of collations" the way did_optimizer.agi originally did before it was fixed.
+# comparisons against VICIdial inventory do not hit "Illegal mix of collations".
 mysqli_query($link, "SET NAMES utf8 COLLATE utf8_unicode_ci");
 
 $PHP_AUTH_USER=$_SERVER['PHP_AUTH_USER'];
@@ -307,76 +306,35 @@ elseif ($action == 'upload_csv')
 elseif ($action == 'sync')
 	{
 	$sync_campaign  = diop_clean_campaign_id(isset($_POST['sync_campaign_id']) ? $_POST['sync_campaign_id'] : '');
-	$sync_use_advanced = isset($_POST['sync_use_advanced']) && $_POST['sync_use_advanced'] == 'Y';
-	$sync_npas_raw  = isset($_POST['sync_npas']) ? trim($_POST['sync_npas']) : '';
-	$sync_npa_count = max(1, min(300, isset($_POST['sync_npa_count']) ? (int)$_POST['sync_npa_count'] : 50));
-	$sync_per_npa   = max(1, min(50, isset($_POST['sync_per_npa']) ? (int)$_POST['sync_per_npa'] : 1));
-	$sync_enabled   = (isset($_POST['sync_enabled']) && $_POST['sync_enabled'] == 'N') ? 'N' : 'Y';
-	$sync_priority  = isset($_POST['sync_admin_priority']) ? (int)$_POST['sync_admin_priority'] : 0;
-	$sync_limit     = max(0, isset($_POST['sync_daily_limit']) ? (int)$_POST['sync_daily_limit'] : 10);
+	$sync_cid_group = diop_clean_campaign_id(isset($_POST['sync_cid_group_id']) ? $_POST['sync_cid_group_id'] : 'NORMAL');
 
-	if ($sync_campaign == '')
+	if ($sync_campaign == '' || $sync_cid_group == '')
 		{
-		$message = "Target campaign is required for sync.";
+		$message = "Source CID group and target campaign are required for sync.";
 		$message_class = 'diop-err';
 		}
 	else
 		{
-		$npas = array();
-		if ($sync_use_advanced && $sync_npas_raw != '')
+		$stmt = mysqli_prepare($link,
+			"SELECT outbound_cid
+			   FROM vicidial_campaign_cid_areacodes
+			  WHERE campaign_id = ? AND COALESCE(outbound_cid, '') <> ''
+			  ORDER BY outbound_cid");
+		mysqli_stmt_bind_param($stmt, 's', $sync_cid_group);
+		mysqli_stmt_execute($stmt);
+		$res = mysqli_stmt_get_result($stmt);
+		$source_rows = 0; $added = 0; $dup = 0; $invalid = 0;
+		while ($row = mysqli_fetch_assoc($res))
 			{
-			foreach (preg_split('/[,\s]+/', $sync_npas_raw) as $n)
-				{
-				$n = diop_clean_digits($n, 3);
-				if (strlen($n) == 3) {$npas[] = $n;}
-				}
+			$source_rows++;
+			$did_number = diop_clean_digits($row['outbound_cid'], 32);
+			$result = diop_insert_did($link, $did_number, $sync_campaign, '', 'Y', 0, 0);
+			if ($result == 'added') {$added++;}
+			elseif ($result == 'duplicate') {$dup++;}
+			else {$invalid++;}
 			}
-		else
-			{
-			$npa_sql = "SELECT SUBSTRING(did_pattern,2,3) AS npa, COUNT(*) AS cnt
-				   FROM vicidial_inbound_dids
-				  WHERE did_pattern REGEXP '^1[0-9]{10}$'
-				  GROUP BY npa
-				  ORDER BY cnt DESC";
-			if ($sync_use_advanced) {$npa_sql .= " LIMIT " . (int)$sync_npa_count;}
-			$rslt = mysqli_query($link, $npa_sql);
-			while ($row = mysqli_fetch_assoc($rslt))
-				{$npas[] = $row['npa'];}
-			}
-		$npas = array_values(array_unique($npas));
-
-		$added = 0; $dup = 0; $skipped_no_candidate = 0;
-		foreach ($npas as $npa)
-			{
-			$did_sql = "SELECT did_pattern FROM vicidial_inbound_dids
-				  WHERE did_pattern LIKE ?
-				    AND did_pattern REGEXP '^1[0-9]{10}$'
-				    AND did_pattern NOT IN (
-				        SELECT did_number FROM did_optimizer_pool WHERE campaign_id = ?
-				    )
-				  ORDER BY did_id";
-			if ($sync_use_advanced) {$did_sql .= " LIMIT ?";}
-			$stmt = mysqli_prepare($link, $did_sql);
-			$like = '1' . $npa . '%';
-			if ($sync_use_advanced)
-				{mysqli_stmt_bind_param($stmt, 'ssi', $like, $sync_campaign, $sync_per_npa);}
-			else
-				{mysqli_stmt_bind_param($stmt, 'ss', $like, $sync_campaign);}
-			mysqli_stmt_execute($stmt);
-			$res = mysqli_stmt_get_result($stmt);
-			$found_any = false;
-			while ($row = mysqli_fetch_assoc($res))
-				{
-				$found_any = true;
-				$result = diop_insert_did($link, $row['did_pattern'], $sync_campaign, $npa, $sync_enabled, $sync_priority, $sync_limit);
-				if ($result == 'added') {$added++;}
-				elseif ($result == 'duplicate') {$dup++;}
-				}
-			mysqli_stmt_close($stmt);
-			if (!$found_any) {$skipped_no_candidate++;}
-			}
-		$mode = $sync_use_advanced ? 'advanced selection' : 'all available inventory';
-		$message = "Sync complete ($mode): $added DIDs added across " . count($npas) . " area code(s) ($dup duplicates skipped, $skipped_no_candidate area codes had no available DIDs).";
+		mysqli_stmt_close($stmt);
+		$message = "CID group $sync_cid_group sync complete: all $source_rows source DIDs processed; $added added, $dup already present, $invalid invalid.";
 		}
 	}
 elseif ($action == 'bulk_limit')
@@ -408,6 +366,11 @@ $campaign_rows = array();
 $rslt = mysqli_query($link, "SELECT campaign_id, campaign_name FROM vicidial_campaigns ORDER BY campaign_id;");
 while ($row = mysqli_fetch_assoc($rslt))
 	{$campaign_rows[] = $row;}
+
+$cid_group_rows = array();
+$rslt = mysqli_query($link, "SELECT cid_group_id, cid_group_notes FROM vicidial_cid_groups ORDER BY cid_group_id;");
+while ($row = mysqli_fetch_assoc($rslt))
+	{$cid_group_rows[] = $row;}
 
 $where_parts = array();
 if ($filter_campaign != '')
@@ -626,7 +589,7 @@ input:focus, select:focus { outline: none; border-color: #7890e9 !important; box
 <section class="diop-actions" aria-label="Pool actions">
 <label for="modal-add" class="diop-action diop-action-primary"><strong>＋ Add a single DID</strong><span>Create one campaign-owned caller ID.</span></label>
 <label for="modal-csv" class="diop-action"><strong>Upload CSV</strong><span>Import a prepared inventory in bulk.</span></label>
-<label for="modal-sync" class="diop-action"><strong>Sync VICIdial inventory</strong><span>Bring authorized inbound DIDs into the pool.</span></label>
+<label for="modal-sync" class="diop-action"><strong>Sync VICIdial CID group</strong><span>Bring outbound CID-group DIDs into the pool.</span></label>
 <label for="modal-bulk" class="diop-action"><strong>Set campaign limits</strong><span>Apply one daily cap across a campaign.</span></label>
 <label for="modal-reputation" class="diop-action"><strong>Reputation settings</strong><span>Configure shared API access and cache lifetime.</span></label>
 </section>
@@ -734,14 +697,25 @@ Only did_number is required per row &mdash; blank columns fall back to the defau
 <label for="modal-none" class="absolute inset-0"></label>
 <div class="relative bg-white rounded-lg shadow-2xl w-[92%] max-w-md max-h-[86vh] overflow-y-auto p-6">
 <label for="modal-none" class="absolute top-2.5 right-2.5 w-7 h-7 flex items-center justify-center rounded-full text-gray-400 hover:text-gray-700 hover:bg-gray-100 cursor-pointer text-lg">&times;</label>
-<h2 class="text-base font-semibold mb-2 pr-8">Sync from VICIdial DID inventory</h2>
+<h2 class="text-base font-semibold mb-2 pr-8">Sync from VICIdial CID group</h2>
 <div class="text-xs text-gray-400 mb-4">
-Pulls real leased/owned numbers already in VICIdial's own <code class="font-mono">vicidial_inbound_dids</code> table
-into this pool, spread across area codes for local-presence coverage. Numbers already in the target
-campaign's pool are skipped automatically.
+Pulls outbound numbers from <code class="font-mono">vicidial_campaign_cid_areacodes</code> for the selected
+CID group. All group rows are eligible regardless of the source row's active flag; the optimizer's Enabled
+status is set to Y with priority 0 and unlimited daily usage. Existing numbers in the target campaign are skipped.
 </div>
 <form method="post" action="<?php echo htmlspecialchars($PHP_SELF); ?>" class="space-y-3">
 <input type="hidden" name="action" value="sync">
+<div>
+<label class="block text-xs text-gray-500 mb-1">Source CID Group</label>
+<select name="sync_cid_group_id" required class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+<option value="">-- select --</option>
+<?php foreach ($cid_group_rows as $g) {
+	$selected = ($g['cid_group_id'] == 'NORMAL') ? ' selected' : '';
+	$group_label = $g['cid_group_id'] . ($g['cid_group_notes'] != '' ? ' - ' . $g['cid_group_notes'] : '');
+	echo '<option value="'.htmlspecialchars($g['cid_group_id']).'"'.$selected.'>'.htmlspecialchars($group_label).'</option>';
+} ?>
+</select>
+</div>
 <div>
 <label class="block text-xs text-gray-500 mb-1">Target Campaign</label>
 <select name="sync_campaign_id" required class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
@@ -751,43 +725,7 @@ campaign's pool are skipped automatically.
 } ?>
 </select>
 </div>
-<label class="flex gap-2 text-xs text-gray-600 border border-gray-200 rounded-md p-3 bg-gray-50">
-<input type="checkbox" name="sync_use_advanced" value="Y" class="mt-0.5">
-<span><strong>Use advanced selection</strong><br><span class="text-gray-400">Apply the area-code and quantity limits below. Leave unchecked to import all available VICIdial DIDs.</span></span>
-</label>
-<div>
-<label class="block text-xs text-gray-500 mb-1">Specific area codes (advanced, comma-separated)</label>
-<input type="text" name="sync_npas" placeholder="e.g. 442, 626, 212"
-       class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
-<div class="text-xs text-gray-400 mt-1">When advanced mode is enabled and this is blank, the most populated area codes are selected.</div>
-</div>
-<div class="grid grid-cols-2 gap-3">
-<div>
-<label class="block text-xs text-gray-500 mb-1"># of area codes (if auto-picking)</label>
-<input type="number" name="sync_npa_count" value="50" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
-</div>
-<div>
-<label class="block text-xs text-gray-500 mb-1">DIDs per area code</label>
-<input type="number" name="sync_per_npa" value="1" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
-</div>
-</div>
-<div class="grid grid-cols-2 gap-3">
-<div>
-<label class="block text-xs text-gray-500 mb-1">Enabled</label>
-<select name="sync_enabled" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
-<option value="Y">Y</option><option value="N">N</option>
-</select>
-</div>
-<div>
-<label class="block text-xs text-gray-500 mb-1">Admin Priority</label>
-<input type="number" name="sync_admin_priority" value="0" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
-</div>
-</div>
-<div>
-<label class="block text-xs text-gray-500 mb-1">Daily Limit (0 = unlimited)</label>
-<input type="number" name="sync_daily_limit" value="10" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
-</div>
-<button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-md py-2">Sync available DIDs</button>
+<button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-md py-2">Import all DIDs</button>
 </form>
 </div>
 </div>
