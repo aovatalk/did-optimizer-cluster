@@ -73,7 +73,7 @@ sudo ./install_did_optimizer.sh --role database
 Expected result:
 
 ```text
-Shared database schema ready (5 tables).
+Shared database schema ready (6 tables).
 ```
 
 The database role connects through the local MySQL socket. It does not require
@@ -99,6 +99,39 @@ The dialer role installs:
 No server address or database credential is passed to the installer. Dialer
 nodes read `VARserver_ip` and all `VARDB_*` settings from their existing
 `/etc/astguiclient.conf`; the PHP page uses VICIdial's existing database layer.
+
+## Admin features
+
+The cluster-compatible VICIdial admin page provides:
+
+- single and CSV DID imports;
+- full synchronization of all available `vicidial_inbound_dids` inventory;
+- optional advanced synchronization limited by area codes and DIDs per area;
+- campaign-wide and per-DID daily limits;
+- reputation filtering and cached provider results;
+- cluster-node visibility for assignment history;
+- browser-persisted automatic refresh intervals; and
+- dismissible success and error toast notifications.
+
+### Reputation configuration
+
+Open **Reputation settings** from the DID Optimizer admin page. Enter the API
+URL, API key, and cache lifetime once. They are stored in the shared
+`did_optimizer_settings` table, so all web nodes use the same configuration.
+No `/etc/did_optimizer_reputation.json` file is used, and the API key is never
+rendered back into the page.
+
+For stale or missing entries, the page sends an HTTP POST with an `x-api-key`
+header and a JSON body such as:
+
+```json
+{"numbers":["+12125550101","+13125550102"]}
+```
+
+The provider response must contain a `results` array. Each result can include
+`number`, `rk_reputation`, `rk_status`, and `error`. Results are shared through
+`did_optimizer_reputation_cache`; the AGI uses a neutral reputation component
+when the provider is not configured or a DID has no result.
 
 ### Data safety
 
@@ -130,7 +163,7 @@ sudo /usr/local/share/did-optimizer/quick-test.sh
 
 Run the test on every dialer/web node. It reads the shared database connection
 and local server identity from `/etc/astguiclient.conf`, then validates the Perl
-AGI and PHP deployments, all five tables and indexes, and active plus persistent
+AGI and PHP deployments, all six tables and indexes, and active plus persistent
 dialplan integration.
 
 The database node does not need the dialer health test. Its schema is verified

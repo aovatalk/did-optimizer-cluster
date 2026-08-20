@@ -77,11 +77,138 @@ function diop_insert_did($link, $did_number, $campaign_id, $local_key, $enabled,
 	return 'error';
 	}
 
+function diop_shared_settings($link)
+	{
+	$settings = array();
+	$rslt = mysqli_query($link,
+		"SELECT setting_key, setting_value FROM did_optimizer_settings
+		  WHERE setting_key IN ('reputation_api_url','reputation_api_key','reputation_cache_ttl')");
+	if ($rslt)
+		{
+		while ($row = mysqli_fetch_assoc($rslt)) {$settings[$row['setting_key']] = $row['setting_value'];}
+		}
+	return $settings;
+	}
+
+function diop_reputation_config($link)
+	{
+	$settings = diop_shared_settings($link);
+	if (empty($settings['reputation_api_url']) || empty($settings['reputation_api_key'])) {return null;}
+	return array(
+		'api_url' => $settings['reputation_api_url'],
+		'api_key' => $settings['reputation_api_key'],
+		'cache_ttl' => isset($settings['reputation_cache_ttl'])
+			? max(60, min(86400, (int)$settings['reputation_cache_ttl'])) : 900,
+	);
+	}
+
+function diop_save_setting($link, $key, $value)
+	{
+	$stmt = mysqli_prepare($link,
+		"INSERT INTO did_optimizer_settings (setting_key, setting_value)
+		 VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)");
+	mysqli_stmt_bind_param($stmt, 'ss', $key, $value);
+	$ok = mysqli_stmt_execute($stmt);
+	mysqli_stmt_close($stmt);
+	return $ok;
+	}
+
+function diop_load_reputations($link, $numbers)
+	{
+	$results = array(); $normalized = array();
+	foreach ($numbers as $number)
+		{
+		$digits = preg_replace('/\D/', '', $number);
+		if ($digits != '') {$normalized[$digits] = $digits;}
+		}
+	if (!count($normalized)) {return $results;}
+
+	$config = diop_reputation_config($link);
+	$ttl = $config ? $config['cache_ttl'] : 900;
+	$quoted = array();
+	foreach ($normalized as $digits) {$quoted[] = "'" . mysqli_real_escape_string($link, $digits) . "'";}
+	$sql = "SELECT did_number, reputation, lookup_status, lookup_error, checked_at,
+	               checked_at >= (NOW() - INTERVAL " . (int)$ttl . " SECOND) AS is_fresh
+	          FROM did_optimizer_reputation_cache
+	         WHERE did_number IN (" . implode(',', $quoted) . ")";
+	$rslt = mysqli_query($link, $sql);
+	if ($rslt) {while ($row = mysqli_fetch_assoc($rslt)) {$results[$row['did_number']] = $row;}}
+
+	$stale = array();
+	foreach ($normalized as $digits)
+		{
+		if (!isset($results[$digits]) || !$results[$digits]['is_fresh']) {$stale[] = '+' . $digits;}
+		}
+	if ($config && count($stale) && function_exists('curl_init'))
+		{
+		$ch = curl_init($config['api_url']);
+		curl_setopt_array($ch, array(
+			CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_CONNECTTIMEOUT => 3, CURLOPT_TIMEOUT => 10,
+			CURLOPT_HTTPHEADER => array('Content-Type: application/json', 'x-api-key: ' . $config['api_key']),
+			CURLOPT_POSTFIELDS => json_encode(array('numbers' => $stale)),
+		));
+		$body = curl_exec($ch);
+		$http_code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		$curl_error = curl_error($ch);
+		curl_close($ch);
+		$payload = ($body !== false && $http_code >= 200 && $http_code < 300) ? json_decode($body, true) : null;
+		if (is_array($payload) && isset($payload['results']) && is_array($payload['results']))
+			{
+			$stmt = mysqli_prepare($link,
+				"INSERT INTO did_optimizer_reputation_cache
+				    (did_number, reputation, lookup_status, lookup_error, checked_at)
+				 VALUES (?, ?, ?, ?, NOW())
+				 ON DUPLICATE KEY UPDATE reputation=VALUES(reputation), lookup_status=VALUES(lookup_status),
+				                         lookup_error=VALUES(lookup_error), checked_at=NOW()");
+			foreach ($payload['results'] as $item)
+				{
+				$digits = isset($item['number']) ? preg_replace('/\D/', '', $item['number']) : '';
+				if ($digits == '' || !isset($normalized[$digits])) {continue;}
+				$reputation = isset($item['rk_reputation']) ? substr((string)$item['rk_reputation'], 0, 32) : null;
+				$status = isset($item['rk_status']) ? substr((string)$item['rk_status'], 0, 32) : null;
+				$error = !empty($item['error']) ? substr((string)$item['error'], 0, 255) : null;
+				mysqli_stmt_bind_param($stmt, 'ssss', $digits, $reputation, $status, $error);
+				mysqli_stmt_execute($stmt);
+				$results[$digits] = array('did_number'=>$digits, 'reputation'=>$reputation,
+					'lookup_status'=>$status, 'lookup_error'=>$error, 'checked_at'=>date('Y-m-d H:i:s'), 'is_fresh'=>1);
+				}
+			mysqli_stmt_close($stmt);
+			}
+		elseif (!count($results))
+			{
+			$results['_request_error'] = array('lookup_error' => $curl_error ? $curl_error : "HTTP $http_code");
+			}
+		}
+	return $results;
+	}
+
 $action = isset($_POST['action']) ? $_POST['action'] : '';
 $message = '';
 $message_class = 'diop-ok';
 
-if ($action == 'add')
+if ($action == 'reputation_settings')
+	{
+	$api_url = isset($_POST['reputation_api_url']) ? trim($_POST['reputation_api_url']) : '';
+	$api_key = isset($_POST['reputation_api_key']) ? trim($_POST['reputation_api_key']) : '';
+	$cache_ttl = max(60, min(86400, isset($_POST['reputation_cache_ttl']) ? (int)$_POST['reputation_cache_ttl'] : 900));
+	$existing_settings = diop_shared_settings($link);
+	if ($api_key == '' && isset($existing_settings['reputation_api_key'])) {$api_key = $existing_settings['reputation_api_key'];}
+	$scheme = strtolower((string)parse_url($api_url, PHP_URL_SCHEME));
+	if (!filter_var($api_url, FILTER_VALIDATE_URL) || !in_array($scheme, array('http','https')))
+		{$message = 'Reputation API URL must be a valid HTTP or HTTPS URL.'; $message_class = 'diop-err';}
+	elseif ($api_key == '')
+		{$message = 'Reputation API key is required for initial configuration.'; $message_class = 'diop-err';}
+	else
+		{
+		$ok = diop_save_setting($link, 'reputation_api_url', $api_url)
+			&& diop_save_setting($link, 'reputation_api_key', $api_key)
+			&& diop_save_setting($link, 'reputation_cache_ttl', (string)$cache_ttl);
+		if ($ok) {$message = 'Shared reputation settings updated for all web nodes.';}
+		else {$message = 'Could not update reputation settings: ' . mysqli_error($link); $message_class = 'diop-err';}
+		}
+	}
+elseif ($action == 'add')
 	{
 	$did_number  = diop_clean_digits($_POST['did_number'], 32);
 	$campaign_id = diop_clean_campaign_id($_POST['campaign_id']);
@@ -179,13 +306,14 @@ elseif ($action == 'upload_csv')
 	}
 elseif ($action == 'sync')
 	{
-	$sync_campaign  = diop_clean_campaign_id($_POST['sync_campaign_id']);
-	$sync_npas_raw  = trim($_POST['sync_npas']);
-	$sync_npa_count = max(1, min(300, (int)$_POST['sync_npa_count']));
-	$sync_per_npa   = max(1, min(50, (int)$_POST['sync_per_npa']));
-	$sync_enabled   = ($_POST['sync_enabled'] == 'N') ? 'N' : 'Y';
-	$sync_priority  = (int)$_POST['sync_admin_priority'];
-	$sync_limit     = max(0, (int)$_POST['sync_daily_limit']);
+	$sync_campaign  = diop_clean_campaign_id(isset($_POST['sync_campaign_id']) ? $_POST['sync_campaign_id'] : '');
+	$sync_use_advanced = isset($_POST['sync_use_advanced']) && $_POST['sync_use_advanced'] == 'Y';
+	$sync_npas_raw  = isset($_POST['sync_npas']) ? trim($_POST['sync_npas']) : '';
+	$sync_npa_count = max(1, min(300, isset($_POST['sync_npa_count']) ? (int)$_POST['sync_npa_count'] : 50));
+	$sync_per_npa   = max(1, min(50, isset($_POST['sync_per_npa']) ? (int)$_POST['sync_per_npa'] : 1));
+	$sync_enabled   = (isset($_POST['sync_enabled']) && $_POST['sync_enabled'] == 'N') ? 'N' : 'Y';
+	$sync_priority  = isset($_POST['sync_admin_priority']) ? (int)$_POST['sync_admin_priority'] : 0;
+	$sync_limit     = max(0, isset($_POST['sync_daily_limit']) ? (int)$_POST['sync_daily_limit'] : 10);
 
 	if ($sync_campaign == '')
 		{
@@ -195,7 +323,7 @@ elseif ($action == 'sync')
 	else
 		{
 		$npas = array();
-		if ($sync_npas_raw != '')
+		if ($sync_use_advanced && $sync_npas_raw != '')
 			{
 			foreach (preg_split('/[,\s]+/', $sync_npas_raw) as $n)
 				{
@@ -205,31 +333,35 @@ elseif ($action == 'sync')
 			}
 		else
 			{
-			$rslt = mysqli_query($link,
-				"SELECT SUBSTRING(did_pattern,2,3) AS npa, COUNT(*) AS cnt
+			$npa_sql = "SELECT SUBSTRING(did_pattern,2,3) AS npa, COUNT(*) AS cnt
 				   FROM vicidial_inbound_dids
 				  WHERE did_pattern REGEXP '^1[0-9]{10}$'
 				  GROUP BY npa
-				  ORDER BY cnt DESC
-				  LIMIT " . (int)$sync_npa_count . ";");
+				  ORDER BY cnt DESC";
+			if ($sync_use_advanced) {$npa_sql .= " LIMIT " . (int)$sync_npa_count;}
+			$rslt = mysqli_query($link, $npa_sql);
 			while ($row = mysqli_fetch_assoc($rslt))
 				{$npas[] = $row['npa'];}
 			}
+		$npas = array_values(array_unique($npas));
 
 		$added = 0; $dup = 0; $skipped_no_candidate = 0;
 		foreach ($npas as $npa)
 			{
-			$stmt = mysqli_prepare($link,
-				"SELECT did_pattern FROM vicidial_inbound_dids
+			$did_sql = "SELECT did_pattern FROM vicidial_inbound_dids
 				  WHERE did_pattern LIKE ?
 				    AND did_pattern REGEXP '^1[0-9]{10}$'
 				    AND did_pattern NOT IN (
 				        SELECT did_number FROM did_optimizer_pool WHERE campaign_id = ?
 				    )
-				  ORDER BY did_id
-				  LIMIT ?;");
+				  ORDER BY did_id";
+			if ($sync_use_advanced) {$did_sql .= " LIMIT ?";}
+			$stmt = mysqli_prepare($link, $did_sql);
 			$like = '1' . $npa . '%';
-			mysqli_stmt_bind_param($stmt, 'ssi', $like, $sync_campaign, $sync_per_npa);
+			if ($sync_use_advanced)
+				{mysqli_stmt_bind_param($stmt, 'ssi', $like, $sync_campaign, $sync_per_npa);}
+			else
+				{mysqli_stmt_bind_param($stmt, 'ss', $like, $sync_campaign);}
 			mysqli_stmt_execute($stmt);
 			$res = mysqli_stmt_get_result($stmt);
 			$found_any = false;
@@ -243,7 +375,8 @@ elseif ($action == 'sync')
 			mysqli_stmt_close($stmt);
 			if (!$found_any) {$skipped_no_candidate++;}
 			}
-		$message = "Sync complete: $added DIDs added across " . count($npas) . " area code(s) ($dup duplicates skipped, $skipped_no_candidate area codes had no available DIDs).";
+		$mode = $sync_use_advanced ? 'advanced selection' : 'all available inventory';
+		$message = "Sync complete ($mode): $added DIDs added across " . count($npas) . " area code(s) ($dup duplicates skipped, $skipped_no_candidate area codes had no available DIDs).";
 		}
 	}
 elseif ($action == 'bulk_limit')
@@ -269,6 +402,7 @@ elseif ($action == 'bulk_limit')
 $filter_campaign = isset($_GET['campaign_id']) ? diop_clean_campaign_id($_GET['campaign_id']) : '';
 $filter_search   = isset($_GET['q']) ? diop_clean_digits($_GET['q'], 32) : '';
 $filter_status   = isset($_GET['status']) && in_array($_GET['status'], array('Y','N')) ? $_GET['status'] : '';
+$filter_reputation = isset($_GET['reputation']) && in_array($_GET['reputation'], array('positive','negative','unknown')) ? $_GET['reputation'] : '';
 
 $campaign_rows = array();
 $rslt = mysqli_query($link, "SELECT campaign_id, campaign_name FROM vicidial_campaigns ORDER BY campaign_id;");
@@ -277,41 +411,47 @@ while ($row = mysqli_fetch_assoc($rslt))
 
 $where_parts = array();
 if ($filter_campaign != '')
-	{$where_parts[] = "campaign_id = '" . mysqli_real_escape_string($link, $filter_campaign) . "'";}
+	{$where_parts[] = "p.campaign_id = '" . mysqli_real_escape_string($link, $filter_campaign) . "'";}
 if ($filter_search != '')
-	{$where_parts[] = "did_number LIKE '%" . mysqli_real_escape_string($link, $filter_search) . "%'";}
+	{$where_parts[] = "p.did_number LIKE '%" . mysqli_real_escape_string($link, $filter_search) . "%'";}
 if ($filter_status != '')
-	{$where_parts[] = "enabled = '" . mysqli_real_escape_string($link, $filter_status) . "'";}
+	{$where_parts[] = "p.enabled = '" . mysqli_real_escape_string($link, $filter_status) . "'";}
+if ($filter_reputation == 'positive' || $filter_reputation == 'negative')
+	{$where_parts[] = "LOWER(COALESCE(rc.reputation,'')) = '" . $filter_reputation . "' AND COALESCE(rc.lookup_error,'') = ''";}
+elseif ($filter_reputation == 'unknown')
+	{$where_parts[] = "(rc.did_number IS NULL OR COALESCE(rc.lookup_error,'') <> '' OR LOWER(COALESCE(rc.reputation,'')) NOT IN ('positive','negative'))";}
 $where = count($where_parts) ? ('WHERE ' . implode(' AND ', $where_parts)) : '';
+$pool_from = "did_optimizer_pool p LEFT JOIN did_optimizer_reputation_cache rc ON rc.did_number = p.did_number";
 
 # Whitelisted sortable columns only - never interpolate $_GET['sort'] directly into SQL.
 $sort_map = array(
-	'did'         => 'did_number',
-	'campaign'    => 'campaign_id',
-	'npa'         => 'local_key',
-	'status'      => 'enabled',
-	'priority'    => 'admin_priority',
-	'limit'       => 'daily_limit',
+	'did'         => 'p.did_number',
+	'campaign'    => 'p.campaign_id',
+	'npa'         => 'p.local_key',
+	'status'      => 'p.enabled',
+	'priority'    => 'p.admin_priority',
+	'limit'       => 'p.daily_limit',
 	'calls_today' => 'calls_today_effective',
-	'total'       => 'total_assignments',
-	'last_used'   => 'last_used',
+	'total'       => 'p.total_assignments',
+	'last_used'   => 'p.last_used',
+	'reputation'  => 'rc.reputation',
 );
 $sort_key = isset($_GET['sort']) && isset($sort_map[$_GET['sort']]) ? $_GET['sort'] : '';
 $sort_dir = (isset($_GET['dir']) && $_GET['dir'] == 'desc') ? 'desc' : 'asc';
 $order_by = $sort_key
 	? ($sort_map[$sort_key] . ' ' . $sort_dir . ', did_id ' . $sort_dir)
-	: 'campaign_id, local_key, did_number';
+	: 'p.campaign_id, p.local_key, p.did_number';
 
 $per_page = 25;
 $page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
 
 $count_rslt = mysqli_query($link,
 	"SELECT COUNT(*) AS cnt,
-	        COALESCE(SUM(enabled='Y'), 0) AS enabled_cnt,
-	        COALESCE(SUM(CASE WHEN usage_date=CURDATE() THEN calls_today ELSE 0 END), 0) AS calls_today_sum,
-	        COALESCE(SUM(total_assignments), 0) AS assignments_sum,
-	        COALESCE(SUM(daily_limit>0 AND (CASE WHEN usage_date=CURDATE() THEN calls_today ELSE 0 END)>=daily_limit), 0) AS limit_reached_cnt
-	   FROM did_optimizer_pool $where;");
+	        COALESCE(SUM(p.enabled='Y'), 0) AS enabled_cnt,
+	        COALESCE(SUM(CASE WHEN p.usage_date=CURDATE() THEN p.calls_today ELSE 0 END), 0) AS calls_today_sum,
+	        COALESCE(SUM(p.total_assignments), 0) AS assignments_sum,
+	        COALESCE(SUM(p.daily_limit>0 AND (CASE WHEN p.usage_date=CURDATE() THEN p.calls_today ELSE 0 END)>=p.daily_limit), 0) AS limit_reached_cnt
+	   FROM $pool_from $where;");
 $count_row = mysqli_fetch_assoc($count_rslt);
 $total_filtered = (int)$count_row['cnt'];
 $total_filtered_enabled = (int)$count_row['enabled_cnt'];
@@ -324,16 +464,25 @@ $offset = ($page - 1) * $per_page;
 
 $pool_rows = array();
 $rslt = mysqli_query($link,
-	"SELECT did_id, did_number, campaign_id, local_key, enabled, admin_priority,
-	        total_assignments,
-	        CASE WHEN usage_date = CURDATE() THEN calls_today ELSE 0 END AS calls_today_effective,
-	        daily_limit, last_used, created_at
-	   FROM did_optimizer_pool
+	"SELECT p.did_id, p.did_number, p.campaign_id, p.local_key, p.enabled, p.admin_priority,
+	        p.total_assignments,
+	        CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END AS calls_today_effective,
+	        p.daily_limit, p.last_used, p.created_at
+	   FROM $pool_from
 	   $where
 	  ORDER BY $order_by
 	  LIMIT $per_page OFFSET $offset;");
 while ($row = mysqli_fetch_assoc($rslt))
 	{$pool_rows[] = $row;}
+
+$page_reputations = diop_load_reputations($link, array_column($pool_rows, 'did_number'));
+foreach ($pool_rows as $idx => $row)
+	{
+	$digits = preg_replace('/\D/', '', $row['did_number']);
+	$pool_rows[$idx]['reputation_data'] = isset($page_reputations[$digits]) ? $page_reputations[$digits] : null;
+	}
+$reputation_config = diop_reputation_config($link);
+$shared_settings = diop_shared_settings($link);
 
 $total_pool = $total_filtered;
 $total_enabled = $total_filtered_enabled;
@@ -351,6 +500,7 @@ $qs_parts = array();
 if ($filter_campaign != '') {$qs_parts[] = 'campaign_id=' . urlencode($filter_campaign);}
 if ($filter_search != '') {$qs_parts[] = 'q=' . urlencode($filter_search);}
 if ($filter_status != '') {$qs_parts[] = 'status=' . urlencode($filter_status);}
+if ($filter_reputation != '') {$qs_parts[] = 'reputation=' . urlencode($filter_reputation);}
 $qs_base = implode('&', $qs_parts);
 ?>
 <!DOCTYPE html>
@@ -413,6 +563,12 @@ input:focus, select:focus { outline: none; border-color: #7890e9 !important; box
 .diop-modal-overlay > div { border: 1px solid rgba(255,255,255,.7); }
 .diop-empty { padding: 3.5rem 1rem; text-align: center; color: var(--muted); }
 .diop-empty strong { display: block; color: var(--ink); font-size: .9rem; margin-bottom: .3rem; }
+.diop-toast { position: fixed; z-index: 80; top: 1rem; right: 1rem; width: min(26rem,calc(100vw - 2rem));
+	border-radius: .8rem; padding: .85rem 2.7rem .85rem 1rem; box-shadow: 0 18px 50px rgba(17,24,39,.22);
+	transition: opacity .2s ease, transform .2s ease; }
+.diop-toast.is-hiding { opacity: 0; transform: translateY(-.6rem); }
+.diop-toast-close { position: absolute; right: .7rem; top: .55rem; border: 0; background: transparent;
+	font-size: 1.2rem; cursor: pointer; opacity: .65; }
 @media (max-width: 850px) {
 	.diop-stats, .diop-actions { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
@@ -459,7 +615,8 @@ input:focus, select:focus { outline: none; border-color: #7890e9 !important; box
 		? 'bg-red-50 border-red-300 text-red-800'
 		: 'bg-green-50 border-green-300 text-green-800';
 	?>
-<div class="border text-xs rounded-md px-4 py-3 mb-4 <?php echo $box_class; ?>">
+<div id="diop-toast" class="diop-toast border text-xs <?php echo $box_class; ?>" role="status">
+<button type="button" class="diop-toast-close" onclick="diopDismissToast()" aria-label="Dismiss">&times;</button>
 <?php echo htmlspecialchars($message); ?>
 </div>
 <?php } ?>
@@ -471,6 +628,7 @@ input:focus, select:focus { outline: none; border-color: #7890e9 !important; box
 <label for="modal-csv" class="diop-action"><strong>Upload CSV</strong><span>Import a prepared inventory in bulk.</span></label>
 <label for="modal-sync" class="diop-action"><strong>Sync VICIdial inventory</strong><span>Bring authorized inbound DIDs into the pool.</span></label>
 <label for="modal-bulk" class="diop-action"><strong>Set campaign limits</strong><span>Apply one daily cap across a campaign.</span></label>
+<label for="modal-reputation" class="diop-action"><strong>Reputation settings</strong><span>Configure shared API access and cache lifetime.</span></label>
 </section>
 
 <!-- Modal: Add a single DID -->
@@ -593,11 +751,15 @@ campaign's pool are skipped automatically.
 } ?>
 </select>
 </div>
+<label class="flex gap-2 text-xs text-gray-600 border border-gray-200 rounded-md p-3 bg-gray-50">
+<input type="checkbox" name="sync_use_advanced" value="Y" class="mt-0.5">
+<span><strong>Use advanced selection</strong><br><span class="text-gray-400">Apply the area-code and quantity limits below. Leave unchecked to import all available VICIdial DIDs.</span></span>
+</label>
 <div>
-<label class="block text-xs text-gray-500 mb-1">Specific area codes (optional, comma-separated)</label>
-<input type="text" name="sync_npas" placeholder="e.g. 442, 626, 212 - leave blank to auto-pick"
+<label class="block text-xs text-gray-500 mb-1">Specific area codes (advanced, comma-separated)</label>
+<input type="text" name="sync_npas" placeholder="e.g. 442, 626, 212"
        class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
-<div class="text-xs text-gray-400 mt-1">If blank, the area codes with the most available numbers are picked automatically.</div>
+<div class="text-xs text-gray-400 mt-1">When advanced mode is enabled and this is blank, the most populated area codes are selected.</div>
 </div>
 <div class="grid grid-cols-2 gap-3">
 <div>
@@ -625,7 +787,7 @@ campaign's pool are skipped automatically.
 <label class="block text-xs text-gray-500 mb-1">Daily Limit (0 = unlimited)</label>
 <input type="number" name="sync_daily_limit" value="10" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
 </div>
-<button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-md py-2">Sync DIDs</button>
+<button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-md py-2">Sync available DIDs</button>
 </form>
 </div>
 </div>
@@ -661,6 +823,42 @@ Applies one daily limit to every DID currently in the selected campaign's pool
 </div>
 </div>
 
+<!-- Modal: Shared reputation configuration -->
+<input type="radio" name="diop-modal" id="modal-reputation" class="diop-modal-state">
+<div class="diop-modal-overlay hidden fixed inset-0 z-50 items-start justify-center pt-[6vh]">
+<label for="modal-none" class="absolute inset-0"></label>
+<div class="relative bg-white rounded-lg shadow-2xl w-[92%] max-w-md max-h-[86vh] overflow-y-auto p-6">
+<label for="modal-none" class="absolute top-2.5 right-2.5 w-7 h-7 flex items-center justify-center rounded-full text-gray-400 hover:text-gray-700 hover:bg-gray-100 cursor-pointer text-lg">&times;</label>
+<h2 class="text-base font-semibold mb-2 pr-8">Reputation settings</h2>
+<div class="text-xs text-gray-400 mb-4">Stored once in the shared optimizer database and used by every web node. The API key is never rendered back into the page.</div>
+<form method="post" action="<?php echo htmlspecialchars($PHP_SELF); ?>" class="space-y-3">
+<input type="hidden" name="action" value="reputation_settings">
+<div>
+<label class="block text-xs text-gray-500 mb-1">API URL</label>
+<input type="url" name="reputation_api_url" required
+       value="<?php echo htmlspecialchars(isset($shared_settings['reputation_api_url']) ? $shared_settings['reputation_api_url'] : ''); ?>"
+       placeholder="https://provider.example/lookup" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+</div>
+<div>
+<label class="block text-xs text-gray-500 mb-1">API Key</label>
+<input type="password" name="reputation_api_key"
+       placeholder="<?php echo isset($shared_settings['reputation_api_key']) ? 'Configured - leave blank to keep' : 'Required'; ?>"
+       autocomplete="new-password" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+</div>
+<div>
+<label class="block text-xs text-gray-500 mb-1">Cache lifetime (seconds)</label>
+<input type="number" name="reputation_cache_ttl" min="60" max="86400"
+       value="<?php echo (int)(isset($shared_settings['reputation_cache_ttl']) ? $shared_settings['reputation_cache_ttl'] : 900); ?>"
+       class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+</div>
+<div class="text-xs <?php echo $reputation_config ? 'text-green-600' : 'text-amber-600'; ?>">
+Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral reputation score is used)'; ?>
+</div>
+<button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-md py-2">Save shared settings</button>
+</form>
+</div>
+</div>
+
 <div class="diop-filter-card">
 <form method="get" action="<?php echo htmlspecialchars($PHP_SELF); ?>" class="flex flex-wrap items-end gap-3 text-xs">
 <div>
@@ -686,11 +884,27 @@ Applies one daily limit to every DID currently in the selected campaign's pool
 <option value="N" <?php echo ($filter_status=='N')?'selected':''; ?>>Disabled</option>
 </select>
 </div>
+<div>
+<label class="block text-gray-500 mb-1">Reputation</label>
+<select name="reputation" class="border border-gray-300 rounded-md px-2 py-1.5 text-xs">
+<option value="">-- all --</option>
+<option value="positive" <?php echo ($filter_reputation=='positive')?'selected':''; ?>>Positive</option>
+<option value="negative" <?php echo ($filter_reputation=='negative')?'selected':''; ?>>Negative</option>
+<option value="unknown" <?php echo ($filter_reputation=='unknown')?'selected':''; ?>>Unknown / unavailable</option>
+</select>
+</div>
 <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-md font-medium">Filter</button>
-<?php if ($filter_campaign != '' || $filter_search != '' || $filter_status != '') { ?>
+<?php if ($filter_campaign != '' || $filter_search != '' || $filter_status != '' || $filter_reputation != '') { ?>
 <a href="<?php echo htmlspecialchars($PHP_SELF); ?>" class="text-gray-400 hover:text-gray-700 underline">Clear filters</a>
 <?php } ?>
-<div class="ml-auto text-gray-400"><?php echo $total_filtered; ?> matching DID(s)</div>
+<div class="ml-auto flex items-end gap-3">
+<div><label class="block text-gray-500 mb-1">Auto refresh</label>
+<select id="diop-auto-refresh" class="border border-gray-300 rounded-md px-2 py-1.5 text-xs">
+<option value="0">Off</option><option value="15">15 seconds</option><option value="30">30 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option>
+</select></div>
+<div id="diop-refresh-status" class="text-gray-400 pb-1.5"></div>
+<div class="text-gray-400 pb-1.5"><?php echo $total_filtered; ?> matching DID(s)</div>
+</div>
 </form>
 </div>
 
@@ -700,6 +914,7 @@ Applies one daily limit to every DID currently in the selected campaign's pool
 <tr class="bg-gray-50 text-gray-500 uppercase text-[11px] tracking-wide">
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'DID','did',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Campaign','campaign',$sort_key,$sort_dir,$qs_base); ?></th><th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Status','status',$sort_key,$sort_dir,$qs_base); ?></th>
+<th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Reputation','reputation',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Priority','priority',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Daily Limit','limit',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Calls Today','calls_today',$sort_key,$sort_dir,$qs_base); ?></th>
@@ -710,7 +925,7 @@ Applies one daily limit to every DID currently in the selected campaign's pool
 </thead>
 <tbody class="divide-y divide-gray-100">
 <?php if (count($pool_rows) == 0) { ?>
-<tr><td colspan="9" class="diop-empty"><strong>No DIDs found</strong>Adjust the filters or add inventory to this pool.</td></tr>
+<tr><td colspan="10" class="diop-empty"><strong>No DIDs found</strong>Adjust the filters or add inventory to this pool.</td></tr>
 <?php } ?>
 <?php foreach ($pool_rows as $r) {
 	$row_bg = ($r['enabled']=='N') ? 'bg-gray-50 text-gray-400' : '';
@@ -722,6 +937,22 @@ Applies one daily limit to every DID currently in the selected campaign's pool
 <td class="px-3 py-2 font-mono"><?php echo htmlspecialchars($r['did_number']); ?></td>
 <td class="px-3 py-2"><?php echo htmlspecialchars($r['campaign_id']); ?></td>
 <td class="px-3 py-2"><?php echo $badge; ?></td>
+<td class="px-3 py-2">
+<?php
+$rep = isset($r['reputation_data']) ? $r['reputation_data'] : null;
+if (!$rep)
+	{echo '<span class="text-gray-400">Unknown</span>';}
+else
+	{
+	$rep_name = !empty($rep['reputation']) ? $rep['reputation'] : 'Unknown';
+	$rep_lower = strtolower($rep_name);
+	$rep_class = ($rep_lower == 'positive') ? 'text-green-700 bg-green-100'
+		: (($rep_lower == 'negative') ? 'text-red-700 bg-red-100' : 'text-gray-600 bg-gray-100');
+	$title = !empty($rep['lookup_error']) ? $rep['lookup_error'] : ('Checked '.$rep['checked_at']);
+	echo '<span title="'.htmlspecialchars($title).'" class="inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold '.$rep_class.'">'.htmlspecialchars($rep_name).'</span>';
+	}
+?>
+</td>
 <td class="px-3 py-2"><?php echo (int)$r['admin_priority']; ?></td>
 <td class="px-3 py-2"><?php echo (int)$r['daily_limit']; ?></td>
 <td class="px-3 py-2"><?php echo (int)$r['calls_today_effective']; ?></td>
@@ -890,5 +1121,42 @@ Calls placed using <?php echo htmlspecialchars($r['did_number']); ?>
 <?php } ?>
 
 </main>
+<script>
+(function () {
+	var select = document.getElementById('diop-auto-refresh');
+	var status = document.getElementById('diop-refresh-status');
+	var storageKey = 'did_optimizer_auto_refresh_seconds';
+	var timer = null, secondsLeft = 0;
+	if (!select || !status) { return; }
+	function renderStatus() { status.textContent = secondsLeft > 0 ? 'Refresh in ' + secondsLeft + 's' : ''; }
+	function startRefresh(seconds) {
+		if (timer !== null) { window.clearInterval(timer); timer = null; }
+		secondsLeft = seconds; renderStatus();
+		if (seconds < 1) { return; }
+		timer = window.setInterval(function () {
+			secondsLeft--;
+			if (secondsLeft <= 0) { window.location.assign(window.location.pathname + window.location.search); return; }
+			renderStatus();
+		}, 1000);
+	}
+	var saved = '0';
+	try { saved = window.localStorage.getItem(storageKey) || '0'; } catch (ignore) {}
+	if (!select.querySelector('option[value="' + saved + '"]')) { saved = '0'; }
+	select.value = saved; startRefresh(parseInt(saved, 10) || 0);
+	select.onchange = function () {
+		var seconds = parseInt(select.value, 10) || 0;
+		try { window.localStorage.setItem(storageKey, String(seconds)); } catch (ignore) {}
+		startRefresh(seconds);
+	};
+}());
+
+function diopDismissToast() {
+	var toast = document.getElementById('diop-toast');
+	if (!toast || toast.className.indexOf('is-hiding') !== -1) { return; }
+	toast.className += ' is-hiding';
+	window.setTimeout(function () { if (toast.parentNode) { toast.parentNode.removeChild(toast); } }, 220);
+}
+if (document.getElementById('diop-toast')) { window.setTimeout(diopDismissToast, 5000); }
+</script>
 </body>
 </html>

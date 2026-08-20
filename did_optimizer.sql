@@ -83,8 +83,20 @@ CREATE TABLE IF NOT EXISTS did_optimizer_geo_prefixes (
 
 CREATE TABLE IF NOT EXISTS did_optimizer_reputation_cache (
     did_number VARCHAR(32) NOT NULL,
-    reputation ENUM('positive','neutral','negative','unknown') NOT NULL DEFAULT 'unknown',
-    checked_at DATETIME NOT NULL,
+    reputation VARCHAR(32) DEFAULT NULL,
+    lookup_status VARCHAR(32) DEFAULT NULL,
+    lookup_error VARCHAR(255) DEFAULT NULL,
+    checked_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (did_number),
     KEY idx_didopt_reputation_freshness (checked_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
+
+-- Shared cluster configuration. Secrets are managed from the authenticated
+-- VICIdial admin page and are never embedded in deployed files.
+CREATE TABLE IF NOT EXISTS did_optimizer_settings (
+    setting_key VARCHAR(64) NOT NULL,
+    setting_value TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (setting_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;

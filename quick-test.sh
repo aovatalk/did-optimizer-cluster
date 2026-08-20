@@ -172,19 +172,19 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
         "SELECT COUNT(*) FROM information_schema.TABLES
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments','did_optimizer_campaign_state',
-              'did_optimizer_geo_prefixes','did_optimizer_reputation_cache');" 2>/dev/null)
-    [[ "$table_count" == '5' ]] \
-        && pass 'all five optimizer tables exist' \
-        || fail "expected 5 optimizer tables, found ${table_count:-unknown}"
+              'did_optimizer_geo_prefixes','did_optimizer_reputation_cache','did_optimizer_settings');" 2>/dev/null)
+    [[ "$table_count" == '6' ]] \
+        && pass 'all six optimizer tables exist' \
+        || fail "expected 6 optimizer tables, found ${table_count:-unknown}"
 
     engine_count=$(mysql_db --batch --skip-column-names -e \
         "SELECT COUNT(*) FROM information_schema.TABLES
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments','did_optimizer_campaign_state',
-              'did_optimizer_geo_prefixes','did_optimizer_reputation_cache')
+              'did_optimizer_geo_prefixes','did_optimizer_reputation_cache','did_optimizer_settings')
             AND ENGINE='InnoDB'
             AND TABLE_COLLATION IN ('utf8_unicode_ci','utf8mb3_unicode_ci');" 2>/dev/null)
-    [[ "$engine_count" == '5' ]] \
+    [[ "$engine_count" == '6' ]] \
         && pass 'all optimizer tables use InnoDB and a compatible utf8 Unicode collation' \
         || {
             fail 'one or more optimizer tables has the wrong engine or collation'
@@ -195,7 +195,7 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
                   WHERE TABLE_SCHEMA='$DB_NAME'
                     AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments',
                       'did_optimizer_campaign_state','did_optimizer_geo_prefixes',
-                      'did_optimizer_reputation_cache')
+                      'did_optimizer_reputation_cache','did_optimizer_settings')
                   ORDER BY TABLE_NAME;" 2>/dev/null || true)
             while IFS= read -r storage_line; do
                 [[ -n "$storage_line" ]] && warn "$storage_line"
@@ -203,7 +203,10 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
         }
 
     index_count=$(mysql_db --batch --skip-column-names -e \
-        "SELECT COUNT(DISTINCT TABLE_NAME, INDEX_NAME)
+        "SELECT COUNT(DISTINCT TABLE_NAME,
+                 CASE WHEN TABLE_NAME='did_optimizer_reputation_cache'
+                           AND INDEX_NAME IN ('idx_didopt_reputation_freshness','idx_didopt_reputation_checked')
+                      THEN 'idx_didopt_reputation_time' ELSE INDEX_NAME END)
            FROM information_schema.STATISTICS
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND ((TABLE_NAME='did_optimizer_pool' AND INDEX_NAME IN
@@ -217,10 +220,19 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
                     ('PRIMARY','uq_didopt_geo_exchange_postal','idx_didopt_geo_npanxx',
                      'idx_didopt_geo_npa','idx_didopt_geo_city_state','idx_didopt_geo_state'))
               OR (TABLE_NAME='did_optimizer_reputation_cache' AND INDEX_NAME IN
-                    ('PRIMARY','idx_didopt_reputation_freshness')));" 2>/dev/null)
-    [[ "$index_count" == '19' ]] \
+                    ('PRIMARY','idx_didopt_reputation_freshness','idx_didopt_reputation_checked'))
+              OR (TABLE_NAME='did_optimizer_settings' AND INDEX_NAME='PRIMARY'));" 2>/dev/null)
+    [[ "$index_count" == '20' ]] \
         && pass 'all required optimizer indexes exist' \
-        || fail "expected 19 required indexes, found ${index_count:-unknown}"
+        || fail "expected 20 required indexes, found ${index_count:-unknown}"
+
+    reputation_column_count=$(mysql_db --batch --skip-column-names -e \
+        "SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_NAME='did_optimizer_reputation_cache'
+            AND COLUMN_NAME IN ('reputation','lookup_status','lookup_error','checked_at');" 2>/dev/null)
+    [[ "$reputation_column_count" == '4' ]] \
+        && pass 'reputation cache schema supports provider status and errors' \
+        || fail "expected 4 reputation cache columns, found ${reputation_column_count:-unknown}"
 
     row_summary=$(mysql_db --batch --skip-column-names -e \
         "SELECT CONCAT('pool=', (SELECT COUNT(*) FROM did_optimizer_pool),

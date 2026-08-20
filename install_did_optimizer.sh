@@ -109,7 +109,8 @@ install_database() {
              DROP TABLE IF EXISTS did_optimizer_campaign_state;
              DROP TABLE IF EXISTS did_optimizer_pool;
              DROP TABLE IF EXISTS did_optimizer_geo_prefixes;
-             DROP TABLE IF EXISTS did_optimizer_reputation_cache;"
+             DROP TABLE IF EXISTS did_optimizer_reputation_cache;
+             DROP TABLE IF EXISTS did_optimizer_settings;"
     fi
     printf 'Applying optimizer schema to shared database %s...\n' "$DB_NAME"
     mysql --protocol=socket --database="$DB_NAME" < "$SQL_SOURCE"
@@ -181,14 +182,36 @@ install_database() {
                ADD KEY idx_didopt_assignment_server (server_ip, assigned_at);"
     fi
 
+    # Expand the early minimal reputation cache without discarding cached data.
+    mysql --protocol=socket --database="$DB_NAME" -e \
+        "ALTER TABLE did_optimizer_reputation_cache
+           MODIFY reputation VARCHAR(32) DEFAULT NULL;"
+    for reputation_column in lookup_status lookup_error; do
+        reputation_column_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
+            "SELECT COUNT(*) FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_NAME='did_optimizer_reputation_cache'
+                AND COLUMN_NAME='$reputation_column';")
+        if [[ "$reputation_column_count" == '0' ]]; then
+            if [[ "$reputation_column" == 'lookup_status' ]]; then
+                mysql --protocol=socket --database="$DB_NAME" -e \
+                    "ALTER TABLE did_optimizer_reputation_cache
+                       ADD COLUMN lookup_status VARCHAR(32) DEFAULT NULL AFTER reputation;"
+            else
+                mysql --protocol=socket --database="$DB_NAME" -e \
+                    "ALTER TABLE did_optimizer_reputation_cache
+                       ADD COLUMN lookup_error VARCHAR(255) DEFAULT NULL AFTER lookup_status;"
+            fi
+        fi
+    done
+
     table_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
         "SELECT COUNT(*) FROM information_schema.TABLES
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments',
               'did_optimizer_campaign_state','did_optimizer_geo_prefixes',
-              'did_optimizer_reputation_cache');")
-    [[ "$table_count" == '5' ]] \
-        || die "Schema verification failed: expected 5 optimizer tables, found $table_count"
+              'did_optimizer_reputation_cache','did_optimizer_settings');")
+    [[ "$table_count" == '6' ]] \
+        || die "Schema verification failed: expected 6 optimizer tables, found $table_count"
     printf 'Shared database schema ready (%s tables).\n' "$table_count"
 }
 
