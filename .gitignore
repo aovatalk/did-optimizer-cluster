@@ -1,0 +1,8 @@
+# Local backups
+*.agi.backup*
+
+# Locally generated delivery archives
+*.tar.gz
+
+# Source-oriented internal documentation
+DID_OPTIMIZER.md
