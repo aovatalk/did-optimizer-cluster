@@ -465,6 +465,53 @@ elseif ($action == 'sync')
 		$message = "CID group $sync_cid_group sync complete: all $source_rows source DIDs processed; $added added, $dup already present, $invalid invalid.";
 		}
 	}
+elseif ($action == 'bulk_action')
+	{
+	# ponytail: one prepared statement executed per id (N+1), capped at 1000 rows -
+	# switch to a single UPDATE/DELETE ... WHERE did_id IN (...) if this list ever needs to be huge.
+	$did_ids = array();
+	if (isset($_POST['did_ids']) && is_array($_POST['did_ids']))
+		{
+		foreach (array_slice($_POST['did_ids'], 0, 1000) as $raw_id)
+			{$id = (int)$raw_id; if ($id > 0) {$did_ids[] = $id;}}
+		}
+	$bulk_op = isset($_POST['bulk_op']) ? $_POST['bulk_op'] : '';
+	if (!count($did_ids) || !in_array($bulk_op, array('enable','disable','delete','set_limit')))
+		{
+		$message = "Select at least one DID and a bulk action to apply.";
+		$message_class = 'diop-err';
+		}
+	else
+		{
+		$affected = 0;
+		if ($bulk_op == 'set_limit')
+			{
+			$bulk_row_limit = max(0, (int)(isset($_POST['bulk_row_limit']) ? $_POST['bulk_row_limit'] : 0));
+			$stmt = mysqli_prepare($link, "UPDATE did_optimizer_pool SET daily_limit = ? WHERE did_id = ?");
+			foreach ($did_ids as $id)
+				{mysqli_stmt_bind_param($stmt, 'ii', $bulk_row_limit, $id); mysqli_stmt_execute($stmt); $affected += mysqli_stmt_affected_rows($stmt);}
+			mysqli_stmt_close($stmt);
+			$message = "Set daily limit to $bulk_row_limit for $affected selected DID(s).";
+			}
+		elseif ($bulk_op == 'delete')
+			{
+			$stmt = mysqli_prepare($link, "DELETE FROM did_optimizer_pool WHERE did_id = ?");
+			foreach ($did_ids as $id)
+				{mysqli_stmt_bind_param($stmt, 'i', $id); mysqli_stmt_execute($stmt); $affected += mysqli_stmt_affected_rows($stmt);}
+			mysqli_stmt_close($stmt);
+			$message = "Deleted $affected selected DID(s).";
+			}
+		else
+			{
+			$enabled_val = ($bulk_op == 'enable') ? 'Y' : 'N';
+			$stmt = mysqli_prepare($link, "UPDATE did_optimizer_pool SET enabled = ? WHERE did_id = ?");
+			foreach ($did_ids as $id)
+				{mysqli_stmt_bind_param($stmt, 'si', $enabled_val, $id); mysqli_stmt_execute($stmt); $affected += mysqli_stmt_affected_rows($stmt);}
+			mysqli_stmt_close($stmt);
+			$message = ($enabled_val == 'Y' ? "Enabled " : "Disabled ") . "$affected selected DID(s).";
+			}
+		}
+	}
 elseif ($action == 'bulk_limit')
 	{
 	$bulk_campaign = diop_clean_campaign_id($_POST['bulk_campaign_id']);
@@ -489,6 +536,8 @@ $filter_campaign = isset($_GET['campaign_id']) ? diop_clean_campaign_id($_GET['c
 $filter_search   = isset($_GET['q']) ? diop_clean_digits($_GET['q'], 32) : '';
 $filter_status   = isset($_GET['status']) && in_array($_GET['status'], array('Y','N')) ? $_GET['status'] : '';
 $filter_reputation = isset($_GET['reputation']) && in_array($_GET['reputation'], array('positive','negative','unknown')) ? $_GET['reputation'] : '';
+$filter_local_key = isset($_GET['local_key']) ? diop_clean_digits($_GET['local_key'], 16) : '';
+$filter_at_limit = isset($_GET['at_limit']) && $_GET['at_limit'] == '1';
 
 $campaign_rows = array();
 $rslt = mysqli_query($link, "SELECT campaign_id, campaign_name FROM vicidial_campaigns ORDER BY campaign_id;");
@@ -511,6 +560,10 @@ if ($filter_reputation == 'positive' || $filter_reputation == 'negative')
 	{$where_parts[] = "LOWER(COALESCE(rc.reputation,'')) = '" . $filter_reputation . "' AND COALESCE(rc.lookup_error,'') = ''";}
 elseif ($filter_reputation == 'unknown')
 	{$where_parts[] = "(rc.did_number IS NULL OR COALESCE(rc.lookup_error,'') <> '' OR LOWER(COALESCE(rc.reputation,'')) NOT IN ('positive','negative'))";}
+if ($filter_local_key != '')
+	{$where_parts[] = "p.local_key = '" . mysqli_real_escape_string($link, $filter_local_key) . "'";}
+if ($filter_at_limit)
+	{$where_parts[] = "p.daily_limit > 0 AND (CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END) >= p.daily_limit";}
 $where = count($where_parts) ? ('WHERE ' . implode(' AND ', $where_parts)) : '';
 $pool_from = "did_optimizer_pool p LEFT JOIN did_optimizer_reputation_cache rc ON rc.did_number = p.did_number";
 
@@ -599,6 +652,8 @@ if ($filter_campaign != '') {$qs_parts[] = 'campaign_id=' . urlencode($filter_ca
 if ($filter_search != '') {$qs_parts[] = 'q=' . urlencode($filter_search);}
 if ($filter_status != '') {$qs_parts[] = 'status=' . urlencode($filter_status);}
 if ($filter_reputation != '') {$qs_parts[] = 'reputation=' . urlencode($filter_reputation);}
+if ($filter_local_key != '') {$qs_parts[] = 'local_key=' . urlencode($filter_local_key);}
+if ($filter_at_limit) {$qs_parts[] = 'at_limit=1';}
 $qs_base = implode('&', $qs_parts);
 ?>
 <!DOCTYPE html>
@@ -608,56 +663,110 @@ $qs_base = implode('&', $qs_parts);
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DID Optimizer Pool</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
 :root {
-	--ink: #172033;
-	--muted: #68738a;
-	--line: #dfe5ee;
+	--ink: #1b1b18;
+	--muted: #756f63;
+	--line: #e4e0d6;
 	--surface: #ffffff;
-	--canvas: #f3f6fa;
-	--brand: #3157d5;
-	--brand-dark: #213c9a;
-	--teal: #0d9488;
+	--surface-muted: #f0eee7;
+	--canvas: #f6f5f1;
+	--navy: #16211c;
+	--accent: #245a48;
+	--accent-dark: #163c30;
+	--accent-soft: #e4ede8;
+	--signal: #245a48;
+	--good: #1f8a4c;
+	--bad: #c1442c;
+	--bad-dark: #9c3520;
+	--warn: #b9800f;
 }
 * { box-sizing: border-box; }
 body.diop-body {
 	margin: 0; color: var(--ink); background: var(--canvas);
 	font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
-.diop-hero { position: relative; overflow: hidden; color: white; background: #111a2e; }
-.diop-hero:after {
-	content: ""; position: absolute; width: 32rem; height: 32rem; right: -8rem; top: -20rem;
-	border-radius: 999px; background: radial-gradient(circle, rgba(79,110,232,.65), rgba(79,110,232,0) 68%);
-}
-.diop-hero-inner { position: relative; z-index: 1; max-width: 80rem; margin: auto; padding: 2rem 1.5rem 4.4rem; }
-.diop-eyebrow { font-size: .68rem; letter-spacing: .16em; text-transform: uppercase; color: #aebcf5; font-weight: 800; }
-.diop-title { margin: .35rem 0 .3rem; font-size: clamp(1.6rem, 3vw, 2.35rem); line-height: 1.1; font-weight: 750; }
-.diop-subtitle { max-width: 42rem; color: #aeb8cb; font-size: .86rem; }
-.diop-shell { max-width: 80rem; margin: -2.8rem auto 0; padding: 0 1.5rem 3rem; position: relative; z-index: 2; }
-.diop-stats { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: .8rem; margin-bottom: 1rem; }
-.diop-stat { background: rgba(255,255,255,.98); border: 1px solid rgba(223,229,238,.8); border-radius: 1rem; padding: 1rem 1.1rem; box-shadow: 0 12px 35px rgba(24,35,66,.08); }
-.diop-stat-label { color: var(--muted); font-size: .66rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 800; }
-.diop-stat-value { margin-top: .25rem; font-size: 1.5rem; line-height: 1; font-weight: 750; font-variant-numeric: tabular-nums; }
-.diop-stat-note { color: #98a1b3; font-size: .69rem; margin-top: .35rem; }
-.diop-notice { border: 1px solid #f1d59d; background: #fffaf0; color: #7a5210; border-radius: .85rem; padding: .8rem 1rem; margin-bottom: 1rem; font-size: .74rem; line-height: 1.55; }
-.diop-actions { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: .7rem; margin: 1rem 0; }
-.diop-action { cursor: pointer; display: block; min-height: 5rem; border: 1px solid var(--line); border-radius: .9rem; padding: .9rem 1rem; background: white; box-shadow: 0 4px 16px rgba(24,35,66,.04); transition: .16s ease; }
-.diop-action:hover { transform: translateY(-2px); border-color: #9dafef; box-shadow: 0 10px 24px rgba(49,87,213,.12); }
-.diop-action strong { display: block; color: var(--ink); font-size: .8rem; }
-.diop-action span { display: block; color: var(--muted); font-size: .68rem; margin-top: .3rem; line-height: 1.35; }
-.diop-action-primary { background: linear-gradient(135deg,var(--brand),#5578ea); border-color: transparent; }
-.diop-action-primary strong, .diop-action-primary span { color: white; }
-.diop-action-primary span { opacity: .76; }
-.diop-filter-card, .diop-table-card { background: white; border: 1px solid var(--line); border-radius: 1rem; box-shadow: 0 5px 22px rgba(24,35,66,.045); }
-.diop-filter-card { padding: 1rem; margin-bottom: .85rem; }
-.diop-table-card { overflow: auto; }
-.diop-table-card table { border-collapse: separate; border-spacing: 0; min-width: 1040px; }
-.diop-table-card thead th { position: sticky; top: 0; z-index: 1; background: #f8fafc; border-bottom: 1px solid var(--line); }
+.diop-display { font-family: "Space Grotesk", Inter, sans-serif; }
+.diop-mono { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* Plain top bar: title only, no banner chrome */
+.diop-topbar { background: var(--surface); border-bottom: 1px solid var(--line); }
+.diop-topbar-inner { max-width: 80rem; margin: auto; padding: 1.1rem 1.5rem; }
+.diop-eyebrow { font-size: .66rem; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); font-weight: 700; }
+.diop-title { margin: .2rem 0 0; font-size: 1.5rem; font-weight: 700; color: var(--ink); letter-spacing: -.01em; }
+.diop-subtitle { margin-top: .25rem; color: var(--muted); font-size: .78rem; }
+
+.diop-shell { max-width: 80rem; margin: 0 auto; padding: 1.4rem 1.5rem 3rem; position: relative; z-index: 2; }
+
+/* Stats strip: its own row of cards above the toolbar */
+.diop-statsbar { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: .8rem; margin-bottom: 1rem; }
+.diop-topbar-stat { background: var(--surface); border: 1px solid var(--line); border-radius: 1rem; padding: .9rem 1.1rem;
+	box-shadow: 0 3px 14px rgba(27,27,24,.04); }
+.diop-topbar-stat-value { display: block; color: var(--ink); font-weight: 700; font-size: 1.35rem; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.diop-topbar-stat-label { display: block; color: var(--muted); font-size: .66rem; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; margin-top: .3rem; }
+
+/* Toolbar: action buttons (with description) + filter row merged into one panel */
+.diop-toolbar { background: var(--surface); border: 1px solid var(--line); border-radius: 1.1rem; box-shadow: 0 3px 14px rgba(27,27,24,.04); margin-bottom: 1rem; overflow: hidden; }
+.diop-actions { display: flex; flex-wrap: wrap; gap: .6rem; padding: 1rem; }
+.diop-btn { cursor: pointer; display: flex; flex-direction: column; align-items: flex-start; gap: .15rem; border: 1px solid var(--line); border-radius: .7rem;
+	padding: .55rem .85rem; min-width: 10.5rem; flex: 1 1 10.5rem; max-width: 15rem; background: var(--surface-muted);
+	transition: .15s ease; }
+.diop-btn-label { font-size: .78rem; font-weight: 700; color: var(--ink); }
+.diop-btn-desc { font-size: .68rem; color: var(--muted); line-height: 1.35; }
+.diop-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
+.diop-btn:hover .diop-btn-label { color: var(--accent-dark); }
+.diop-btn-primary { background: var(--accent); border-color: var(--accent); box-shadow: 0 8px 20px rgba(36,90,72,.24); }
+.diop-btn-primary .diop-btn-label { color: #fff; }
+.diop-btn-primary .diop-btn-desc { color: rgba(255,255,255,.78); }
+.diop-btn-primary:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+.diop-btn-primary:hover .diop-btn-label { color: #fff; }
+.diop-filter-card { border-top: 1px solid var(--line); padding: .8rem 1rem; background: var(--surface-muted); margin: 0; }
+
+.diop-table-card { background: var(--surface); border: 1px solid var(--line); border-radius: 1rem; box-shadow: 0 3px 14px rgba(27,27,24,.04); overflow: auto; }
+.diop-table-card table { border-collapse: separate; border-spacing: 0; min-width: 1080px; }
+.diop-table-card thead th { position: sticky; top: 0; z-index: 2; background: var(--surface-muted); border-bottom: 1px solid var(--line); }
 .diop-table-card tbody tr { transition: background .12s ease; }
-.diop-table-card tbody tr:hover { background: #f5f8ff; }
+.diop-table-card tbody tr:hover { background: var(--accent-soft); }
+.diop-col-sticky { position: sticky; left: 0; z-index: 1; background: inherit; box-shadow: 2px 0 6px -4px rgba(27,27,24,.3); }
+thead .diop-col-sticky { z-index: 3; background: var(--surface-muted); }
+/* Explicit color instead of relying on inherited text color for sort-link anchors -
+   inheritance through an <a> depends on Tailwind CDN's preflight loading before paint,
+   which is not guaranteed on every reload (e.g. the auto-refresh timer's full navigation). */
+.diop-table-card thead a { color: var(--muted); text-decoration: none; }
+.diop-table-card thead a:hover { color: var(--accent-dark); }
+
+/* Signature widget: signal-strength meter for the Bayesian score */
+.diop-meter { display: inline-flex; align-items: flex-end; gap: 2px; height: 13px; vertical-align: middle; margin-right: .4rem; }
+.diop-meter-bar { width: 3px; border-radius: 1px; background: var(--line); }
+.diop-meter-bar:nth-child(1) { height: 5px; } .diop-meter-bar:nth-child(2) { height: 7px; }
+.diop-meter-bar:nth-child(3) { height: 9px; } .diop-meter-bar:nth-child(4) { height: 11px; }
+.diop-meter-bar:nth-child(5) { height: 13px; }
+.diop-meter-bar.is-on { background: var(--signal); }
+.diop-score-pct { font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+
+.diop-bulkbar { display: none; position: sticky; top: 0; z-index: 4; align-items: center; gap: .6rem; flex-wrap: wrap;
+	background: var(--navy); color: white; padding: .6rem .9rem; border-radius: .8rem; margin-bottom: .6rem; font-size: .74rem; }
+.diop-bulkbar.is-active { display: flex; }
+.diop-bulkbar button { border: 1px solid rgba(255,255,255,.22); background: rgba(255,255,255,.08); color: white; border-radius: .5rem; padding: .35rem .7rem; cursor: pointer; font-weight: 600; transition: .15s ease; }
+.diop-bulkbar button:hover { background: var(--accent); border-color: var(--accent); }
+.diop-bulkbar button.diop-bulk-danger { background: var(--bad); border-color: var(--bad); }
+.diop-bulkbar button.diop-bulk-danger:hover { background: var(--bad-dark); }
+.diop-bulkbar input[type=number] { width: 5rem; border-radius: .5rem; border: 1px solid rgba(255,255,255,.25); background: rgba(255,255,255,.08); color: white; padding: .35rem .5rem; }
+
 input, select { transition: border-color .15s, box-shadow .15s; }
-input:focus, select:focus { outline: none; border-color: #7890e9 !important; box-shadow: 0 0 0 3px rgba(49,87,213,.12); }
-.diop-modal-overlay { background: rgba(12,18,32,.66); backdrop-filter: blur(4px); padding-left: 1rem; padding-right: 1rem; }
+input:focus, select:focus { outline: none; border-color: var(--accent) !important; box-shadow: 0 0 0 3px rgba(36,90,72,.14); }
+
+/* Retint stock Tailwind blue (modal submit buttons, filter/edit buttons) to the accent palette in one place */
+.diop-shell .bg-blue-600 { background-color: var(--accent) !important; }
+.diop-shell .hover\:bg-blue-700:hover { background-color: var(--accent-dark) !important; }
+.diop-shell .focus\:ring-blue-500:focus { --tw-ring-color: var(--accent) !important; }
+.diop-shell .text-blue-600, .diop-shell .text-blue-700 { color: var(--accent-dark) !important; }
+.diop-shell .hover\:text-blue-600:hover { color: var(--accent-dark) !important; }
+.diop-shell .border-blue-600 { border-color: var(--accent) !important; }
+.diop-modal-overlay { background: rgba(20,24,20,.66); backdrop-filter: blur(4px); padding-left: 1rem; padding-right: 1rem; }
 .diop-modal-overlay > div { border: 1px solid rgba(255,255,255,.7); }
 .diop-empty { padding: 3.5rem 1rem; text-align: center; color: var(--muted); }
 .diop-empty strong { display: block; color: var(--ink); font-size: .9rem; margin-bottom: .3rem; }
@@ -667,15 +776,28 @@ input:focus, select:focus { outline: none; border-color: #7890e9 !important; box
 .diop-toast.is-hiding { opacity: 0; transform: translateY(-.6rem); }
 .diop-toast-close { position: absolute; right: .7rem; top: .55rem; border: 0; background: transparent;
 	font-size: 1.2rem; cursor: pointer; opacity: .65; }
+
+@media (max-width: 760px) {
+	/* Card-ized table: no duplicate markup, just a CSS display-role swap driven by data-label */
+	.diop-table-card table, .diop-table-card thead, .diop-table-card tbody, .diop-table-card th, .diop-table-card td, .diop-table-card tr { display: block; }
+	.diop-table-card { min-width: 0; }
+	.diop-table-card table { min-width: 0; }
+	.diop-table-card thead { display: none; }
+	.diop-table-card tr { border: 1px solid var(--line); border-radius: .75rem; margin: .6rem; padding: .3rem .75rem; }
+	.diop-table-card td { display: flex; justify-content: space-between; align-items: center; gap: .75rem; padding: .4rem 0; border-bottom: 1px dashed var(--line); text-align: right; }
+	.diop-table-card td:last-child { border-bottom: 0; }
+	.diop-table-card td:first-child { justify-content: flex-start; }
+	.diop-table-card td[data-label]:before { content: attr(data-label); color: var(--muted); font-weight: 600; font-size: .66rem; text-transform: uppercase; letter-spacing: .04em; text-align: left; }
+	.diop-col-sticky { position: static; box-shadow: none; }
+}
 @media (max-width: 850px) {
-	.diop-stats, .diop-actions { grid-template-columns: repeat(2,minmax(0,1fr)); }
+	.diop-statsbar { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
 @media (max-width: 520px) {
-	.diop-hero-inner { padding: 1.5rem 1rem 4rem; }
+	.diop-topbar-inner { padding: .9rem 1rem; }
 	.diop-shell { padding-left: .8rem; padding-right: .8rem; }
-	.diop-stats { grid-template-columns: repeat(2,minmax(0,1fr)); }
-	.diop-actions { grid-template-columns: 1fr; }
 }
+
 /*
  * Exclusive CSS-only modal state. Tailwind's default `peer-checked:` variant
  * compiles to the GENERAL sibling combinator (":checked ~ .peer-checked\:X"),
@@ -690,23 +812,22 @@ input:focus, select:focus { outline: none; border-color: #7890e9 !important; box
 </head>
 <body class="diop-body text-sm">
 
-<header class="diop-hero">
-<div class="diop-hero-inner">
+<header class="diop-topbar">
+<div class="diop-topbar-inner">
 <div class="diop-eyebrow">Outbound identity operations</div>
-<h1 class="diop-title">DID Optimizer</h1>
+<h1 class="diop-title diop-display">DID Optimizer</h1>
 <div class="diop-subtitle">Control local-presence inventory, traffic limits, and caller-ID performance from one workspace.</div>
 </div>
 </header>
 
 <main class="diop-shell">
 
-<section class="diop-stats" aria-label="Pool summary">
-<div class="diop-stat"><div class="diop-stat-label">DID inventory</div><div class="diop-stat-value"><?php echo $total_pool; ?></div><div class="diop-stat-note"><?php echo $total_enabled; ?> enabled in current view</div></div>
-<div class="diop-stat"><div class="diop-stat-label">Calls today</div><div class="diop-stat-value"><?php echo $total_calls_today; ?></div><div class="diop-stat-note">Across filtered DIDs</div></div>
-<div class="diop-stat"><div class="diop-stat-label">All assignments</div><div class="diop-stat-value"><?php echo $total_assignments_sum; ?></div><div class="diop-stat-note">Lifetime optimizer selections</div></div>
-<div class="diop-stat"><div class="diop-stat-label">At daily limit</div><div class="diop-stat-value"><?php echo $total_limit_reached; ?></div><div class="diop-stat-note"><?php echo $filter_campaign != '' ? 'Campaign '.htmlspecialchars($filter_campaign) : 'All visible campaigns'; ?></div></div>
+<section class="diop-statsbar" aria-label="Pool summary">
+<div class="diop-topbar-stat" title="<?php echo $total_enabled; ?> enabled in current view"><span class="diop-topbar-stat-value diop-display"><?php echo $total_pool; ?></span><span class="diop-topbar-stat-label">DIDs</span></div>
+<div class="diop-topbar-stat" title="Across filtered DIDs"><span class="diop-topbar-stat-value diop-display"><?php echo $total_calls_today; ?></span><span class="diop-topbar-stat-label">Calls today</span></div>
+<div class="diop-topbar-stat" title="Lifetime optimizer selections"><span class="diop-topbar-stat-value diop-display"><?php echo $total_assignments_sum; ?></span><span class="diop-topbar-stat-label">Assignments</span></div>
+<div class="diop-topbar-stat" title="<?php echo $filter_campaign != '' ? 'Campaign '.htmlspecialchars($filter_campaign) : 'All visible campaigns'; ?>"><span class="diop-topbar-stat-value diop-display"><?php echo $total_limit_reached; ?></span><span class="diop-topbar-stat-label">At limit</span></div>
 </section>
-
 <?php if ($message != '') {
 	$is_err = ($message_class == 'diop-err');
 	$box_class = $is_err
@@ -721,12 +842,12 @@ input:focus, select:focus { outline: none; border-color: #7890e9 !important; box
 
 <input type="radio" name="diop-modal" id="modal-none" class="diop-modal-state" checked>
 
-<section class="diop-actions" aria-label="Pool actions">
-<label for="modal-add" class="diop-action diop-action-primary"><strong>＋ Add a single DID</strong><span>Create one campaign-owned caller ID.</span></label>
-<label for="modal-csv" class="diop-action"><strong>Upload CSV</strong><span>Import a prepared inventory in bulk.</span></label>
-<label for="modal-sync" class="diop-action"><strong>Sync VICIdial CID group</strong><span>Bring outbound CID-group DIDs into the pool.</span></label>
-<label for="modal-bulk" class="diop-action"><strong>Set campaign limits</strong><span>Apply one daily cap across a campaign.</span></label>
-<label for="modal-reputation" class="diop-action"><strong>Reputation settings</strong><span>Configure shared API access and cache lifetime.</span></label>
+<div class="diop-toolbar"><section class="diop-actions" aria-label="Pool actions">
+<label for="modal-add" class="diop-btn diop-btn-primary"><span class="diop-btn-label">＋ Add a single DID</span><span class="diop-btn-desc">Create one campaign-owned caller ID.</span></label>
+<label for="modal-csv" class="diop-btn"><span class="diop-btn-label">Upload CSV</span><span class="diop-btn-desc">Import a prepared inventory in bulk.</span></label>
+<label for="modal-sync" class="diop-btn"><span class="diop-btn-label">Sync VICIdial CID group</span><span class="diop-btn-desc">Bring outbound CID-group DIDs into the pool.</span></label>
+<label for="modal-bulk" class="diop-btn"><span class="diop-btn-label">Set campaign limits</span><span class="diop-btn-desc">Apply one daily cap across a campaign.</span></label>
+<label for="modal-reputation" class="diop-btn"><span class="diop-btn-label">Reputation settings</span><span class="diop-btn-desc">Configure shared API access and cache lifetime.</span></label>
 </section>
 
 <!-- Modal: Add a single DID -->
@@ -966,8 +1087,17 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 <option value="unknown" <?php echo ($filter_reputation=='unknown')?'selected':''; ?>>Unknown / unavailable</option>
 </select>
 </div>
+<div>
+<label class="block text-gray-500 mb-1">Area code</label>
+<input type="text" name="local_key" value="<?php echo htmlspecialchars($filter_local_key); ?>" placeholder="212"
+       class="border border-gray-300 rounded-md px-2 py-1.5 text-xs w-20">
+</div>
+<label class="flex items-center gap-1.5 pb-1.5 text-gray-600 cursor-pointer">
+<input type="checkbox" name="at_limit" value="1" <?php echo $filter_at_limit ? 'checked' : ''; ?>
+       class="rounded border-gray-300"> At daily limit
+</label>
 <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-md font-medium">Filter</button>
-<?php if ($filter_campaign != '' || $filter_search != '' || $filter_status != '' || $filter_reputation != '') { ?>
+<?php if ($filter_campaign != '' || $filter_search != '' || $filter_status != '' || $filter_reputation != '' || $filter_local_key != '' || $filter_at_limit) { ?>
 <a href="<?php echo htmlspecialchars($PHP_SELF); ?>" class="text-gray-400 hover:text-gray-700 underline">Clear filters</a>
 <?php } ?>
 <div class="ml-auto flex items-end gap-3">
@@ -976,15 +1106,30 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 <option value="0">Off</option><option value="15">15 seconds</option><option value="30">30 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option>
 </select></div>
 <div id="diop-refresh-status" class="text-gray-400 pb-1.5"></div>
-<div class="text-gray-400 pb-1.5"><?php echo $total_filtered; ?> matching DID(s)</div>
 </div>
 </form>
-</div>
+</div></div>
 
+<form method="post" action="<?php echo htmlspecialchars($PHP_SELF); ?>" id="diop-bulk-form">
+<input type="hidden" name="action" value="bulk_action">
+<input type="hidden" name="bulk_op" id="diop-bulk-op" value="">
+<div id="diop-bulk-ids"></div>
+</form>
+<div id="diop-bulkbar" class="diop-bulkbar">
+<span id="diop-bulk-count">0 selected</span>
+<button type="button" data-op="enable">Enable</button>
+<button type="button" data-op="disable">Disable</button>
+<span class="flex items-center gap-1">
+<input type="number" id="diop-bulk-limit-input" value="0" min="0" title="Daily limit">
+<button type="button" data-op="set_limit">Set limit</button>
+</span>
+<button type="button" data-op="delete" class="diop-bulk-danger">Delete</button>
+</div>
 <div class="diop-table-card">
 <table class="w-full text-xs">
 <thead>
 <tr class="bg-gray-50 text-gray-500 uppercase text-[11px] tracking-wide">
+<th class="px-3 py-2 text-left diop-col-sticky"><input type="checkbox" id="diop-select-all" class="rounded border-gray-300"></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'DID','did',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Campaign','campaign',$sort_key,$sort_dir,$qs_base); ?></th><th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Status','status',$sort_key,$sort_dir,$qs_base); ?></th>
 <th class="px-3 py-2 text-left"><?php echo diop_sort_link($PHP_SELF,'Reputation','reputation',$sort_key,$sort_dir,$qs_base); ?></th>
@@ -999,7 +1144,7 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 </thead>
 <tbody class="divide-y divide-gray-100">
 <?php if (count($pool_rows) == 0) { ?>
-<tr><td colspan="11" class="diop-empty"><strong>No DIDs found</strong>Adjust the filters or add inventory to this pool.</td></tr>
+<tr><td colspan="12" class="diop-empty"><strong>No DIDs found</strong>Adjust the filters or add inventory to this pool.</td></tr>
 <?php } ?>
 <?php foreach ($pool_rows as $r) {
 	$row_bg = ($r['enabled']=='N') ? 'bg-gray-50 text-gray-400' : '';
@@ -1008,10 +1153,11 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 		: '<span class="inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold bg-red-100 text-red-700">Disabled</span>';
 	?>
 <tr class="<?php echo $row_bg; ?> hover:bg-blue-50/40">
-<td class="px-3 py-2 font-mono"><?php echo htmlspecialchars($r['did_number']); ?></td>
-<td class="px-3 py-2"><?php echo htmlspecialchars($r['campaign_id']); ?></td>
-<td class="px-3 py-2"><?php echo $badge; ?></td>
-<td class="px-3 py-2">
+<td class="px-3 py-2 diop-col-sticky"><input type="checkbox" data-did-id="<?php echo (int)$r['did_id']; ?>" class="diop-row-check rounded border-gray-300"></td>
+<td class="px-3 py-2 diop-mono" data-label="DID"><?php echo htmlspecialchars($r['did_number']); ?></td>
+<td class="px-3 py-2" data-label="Campaign"><?php echo htmlspecialchars($r['campaign_id']); ?></td>
+<td class="px-3 py-2" data-label="Status"><?php echo $badge; ?></td>
+<td class="px-3 py-2" data-label="Reputation">
 <?php
 $rep = isset($r['reputation_data']) ? $r['reputation_data'] : null;
 if (!$rep)
@@ -1027,7 +1173,7 @@ else
 	}
 ?>
 </td>
-<td class="px-3 py-2">
+<td class="px-3 py-2" data-label="Bayesian Score">
 <?php
 $perf = isset($r['performance_data']) ? $r['performance_data'] : null;
 if (!$perf)
@@ -1035,19 +1181,24 @@ if (!$perf)
 else
 	{
 	$score_pct = number_format($perf['score'] * 100, 1);
+	$bars_filled = min(5, max(0, (int)round($perf['score'] * 5)));
 	$title = sprintf('Sample %d | Success %.1f%% | Human %.1f%% | Duration %.1fs | Reputation %s',
 		$perf['sample'], $perf['good_rate'] * 100, $perf['human_rate'] * 100,
 		$perf['duration'], $perf['reputation']);
-	echo '<span title="'.htmlspecialchars($title).'" class="font-semibold text-blue-700">'.$score_pct.'%</span>';
+	echo '<span title="'.htmlspecialchars($title).'" class="inline-flex items-center">';
+	echo '<span class="diop-meter">';
+	for ($bar_i = 1; $bar_i <= 5; $bar_i++)
+		{echo '<span class="diop-meter-bar'.($bar_i <= $bars_filled ? ' is-on' : '').'"></span>';}
+	echo '</span><span class="diop-score-pct">'.$score_pct.'%</span></span>';
 	}
 ?>
 </td>
-<td class="px-3 py-2"><?php echo (int)$r['admin_priority']; ?></td>
-<td class="px-3 py-2"><?php echo (int)$r['daily_limit']; ?></td>
-<td class="px-3 py-2"><?php echo (int)$r['calls_today_effective']; ?></td>
-<td class="px-3 py-2"><?php echo (int)$r['total_assignments']; ?></td>
-<td class="px-3 py-2"><?php echo htmlspecialchars($r['last_used'] ? $r['last_used'] : '-'); ?></td>
-<td class="px-3 py-2">
+<td class="px-3 py-2" data-label="Priority"><?php echo (int)$r['admin_priority']; ?></td>
+<td class="px-3 py-2" data-label="Daily Limit"><?php echo (int)$r['daily_limit']; ?></td>
+<td class="px-3 py-2" data-label="Calls Today"><?php echo (int)$r['calls_today_effective']; ?></td>
+<td class="px-3 py-2" data-label="Total"><?php echo (int)$r['total_assignments']; ?></td>
+<td class="px-3 py-2" data-label="Last Used"><?php echo htmlspecialchars($r['last_used'] ? $r['last_used'] : '-'); ?></td>
+<td class="px-3 py-2" data-label="Actions">
 <div class="flex items-center gap-1.5">
 <label for="modal-view-<?php echo (int)$r['did_id']; ?>" title="View calls"
        class="cursor-pointer w-7 h-7 flex items-center justify-center rounded-md bg-gray-500 hover:bg-gray-600 text-white">
@@ -1248,6 +1399,51 @@ Calls placed using <?php echo htmlspecialchars($r['did_number']); ?>
 		try { window.localStorage.setItem(storageKey, String(seconds)); } catch (ignore) {}
 		startRefresh(seconds);
 	};
+}());
+
+(function () {
+	var bar = document.getElementById('diop-bulkbar');
+	var countEl = document.getElementById('diop-bulk-count');
+	var selectAll = document.getElementById('diop-select-all');
+	var rowChecks = document.querySelectorAll('.diop-row-check');
+	if (!bar || !rowChecks.length) { return; }
+	function checked() { return Array.prototype.filter.call(rowChecks, function (c) { return c.checked; }); }
+	function refresh() {
+		var n = checked().length;
+		bar.classList.toggle('is-active', n > 0);
+		countEl.textContent = n + ' selected';
+		if (selectAll) { selectAll.checked = n === rowChecks.length; }
+	}
+	Array.prototype.forEach.call(rowChecks, function (c) { c.addEventListener('change', refresh); });
+	if (selectAll) {
+		selectAll.addEventListener('change', function () {
+			Array.prototype.forEach.call(rowChecks, function (c) { c.checked = selectAll.checked; });
+			refresh();
+		});
+	}
+	bar.querySelectorAll('button[data-op]').forEach(function (btn) {
+		btn.addEventListener('click', function () {
+			var ids = checked().map(function (c) { return c.getAttribute('data-did-id'); });
+			if (!ids.length) { return; }
+			var op = btn.getAttribute('data-op');
+			if (op === 'delete' && !confirm('Delete ' + ids.length + ' selected DID(s) from the pool?')) { return; }
+			var idsWrap = document.getElementById('diop-bulk-ids');
+			idsWrap.innerHTML = '';
+			ids.forEach(function (id) {
+				var input = document.createElement('input');
+				input.type = 'hidden'; input.name = 'did_ids[]'; input.value = id;
+				idsWrap.appendChild(input);
+			});
+			document.getElementById('diop-bulk-op').value = op;
+			if (op === 'set_limit') {
+				var limitInput = document.createElement('input');
+				limitInput.type = 'hidden'; limitInput.name = 'bulk_row_limit';
+				limitInput.value = document.getElementById('diop-bulk-limit-input').value || '0';
+				idsWrap.appendChild(limitInput);
+			}
+			document.getElementById('diop-bulk-form').submit();
+		});
+	});
 }());
 
 function diopDismissToast() {
