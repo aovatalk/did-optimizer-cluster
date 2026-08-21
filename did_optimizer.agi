@@ -315,6 +315,7 @@ sub get_candidate_dids {
            AND r.checked_at >= (NOW() - INTERVAL 15 MINUTE)
          WHERE p.campaign_id = ?
            AND p.enabled = 'Y'
+           AND (r.reputation IS NULL OR LOWER(r.reputation) <> 'negative')
            AND (p.last_used IS NULL OR
                 DATE_ADD(p.last_used, INTERVAL ? SECOND) <= NOW())
            AND (p.daily_limit = 0 OR
@@ -873,18 +874,25 @@ sub select_and_record {
     my $assignment_id = $db->{'mysql_insertid'};
 
     my $updated = $db->do(q{
-        UPDATE did_optimizer_pool
-           SET calls_today = IF(usage_date = CURDATE(), calls_today + 1, 1),
+        UPDATE did_optimizer_pool p
+           SET calls_today = IF(p.usage_date = CURDATE(), p.calls_today + 1, 1),
                usage_date = CURDATE(),
-               total_assignments = total_assignments + 1,
+               total_assignments = p.total_assignments + 1,
                last_used = NOW()
-         WHERE did_id = ?
-           AND campaign_id = ?
-           AND enabled = 'Y'
-           AND (last_used IS NULL OR
-                DATE_ADD(last_used, INTERVAL ? SECOND) <= NOW())
-           AND (daily_limit = 0 OR
-                CASE WHEN usage_date = CURDATE() THEN calls_today ELSE 0 END < daily_limit)
+         WHERE p.did_id = ?
+           AND p.campaign_id = ?
+           AND p.enabled = 'Y'
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM did_optimizer_reputation_cache r
+                 WHERE r.did_number = p.did_number
+                   AND r.checked_at >= (NOW() - INTERVAL 15 MINUTE)
+                   AND LOWER(r.reputation) = 'negative'
+           )
+           AND (p.last_used IS NULL OR
+                DATE_ADD(p.last_used, INTERVAL ? SECOND) <= NOW())
+           AND (p.daily_limit = 0 OR
+                CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END < p.daily_limit)
     }, undef, $selected->{'did_id'}, $campaign, $DID_COOLDOWN_SECONDS);
     die 'Selected DID became ineligible during update' unless $updated && $updated == 1;
 
