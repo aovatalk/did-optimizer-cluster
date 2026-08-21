@@ -9,9 +9,11 @@ AGI_SOURCE="$SCRIPT_DIR/did_optimizer.agi"
 PHP_SOURCE="$SCRIPT_DIR/admin_did_optimizer_pool.php"
 QUICK_TEST_SOURCE="$SCRIPT_DIR/quick-test.sh"
 FASTAGI_SERVICE_SOURCE="$SCRIPT_DIR/did-optimizer-fastagi.service"
+UNINSTALL_SOURCE="$SCRIPT_DIR/uninstall.sh"
 DB_NAME="asterisk"
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
 FASTAGI_SERVICE_TARGET="/etc/systemd/system/did-optimizer-fastagi.service"
+UNINSTALL_TARGET="/usr/local/sbin/uninstall-did-optimizer"
 MAINTENANCE_DIR="/usr/local/share/did-optimizer"
 ROLE=""
 CLEAN_INSTALL=0
@@ -97,6 +99,7 @@ else
     download_source_file admin_did_optimizer_pool.php
     download_source_file quick-test.sh
 fi
+download_source_file uninstall.sh
 
 install_database() {
     local geo_csv geo_count geo_schema_ready assignment_identity_columns
@@ -278,6 +281,7 @@ install_dialer() {
     install -o root -g root -m 0644 "$FASTAGI_SERVICE_SOURCE" "$MAINTENANCE_DIR/did-optimizer-fastagi.service"
     install -o root -g root -m 0644 "$PHP_SOURCE" "$MAINTENANCE_DIR/admin_did_optimizer_pool.php"
     install -o root -g root -m 0755 "$QUICK_TEST_SOURCE" "$MAINTENANCE_DIR/quick-test.sh"
+    install -o root -g root -m 0755 "$UNINSTALL_SOURCE" "$MAINTENANCE_DIR/uninstall.sh"
     perl -c "$AGI_TARGET"
     php -l "$php_target"
 
@@ -295,13 +299,21 @@ install_dialer() {
         "$AGI_TARGET" "$php_target" "$MAINTENANCE_DIR"
 }
 
+install_uninstaller() {
+    require_command install
+    [[ -r "$UNINSTALL_SOURCE" ]] || die 'Uninstaller source is missing.'
+    install -o root -g root -m 0755 "$UNINSTALL_SOURCE" "$UNINSTALL_TARGET"
+}
+
 [[ "$ROLE" == 'database' ]] && install_database
 [[ "$ROLE" == 'dialer' ]] && install_dialer
+install_uninstaller
 
 printf '%s\n' \
     'DID optimizer installation completed successfully.' \
     "  Role: $ROLE" \
     "  Clean schema: $([[ $CLEAN_INSTALL == 1 ]] && echo Y || echo N)" \
+    "  Uninstaller: $UNINSTALL_TARGET" \
     '  Dialplan: unchanged' \
     '' \
     'Add after call_log and immediately before Dial() on every dialer node:' \

@@ -7,9 +7,16 @@ and least-recently-used balancing among similarly performing numbers.
 ## Architecture
 
 This build supports one shared database and any number of Asterisk/web nodes.
+Each dialer runs a localhost FastAGI service with 16 pre-forked workers. Every
+worker reuses one database connection and maintains bounded performance and
+geography caches, avoiding a new Perl process, database login, and full history
+scan for every call.
+
 Selection counters, assignment history, and the per-campaign concurrency lock
-live in the shared database. Each call is also tagged with the originating
-VICIdial `VARserver_ip`, and live-call discovery is restricted to that server.
+live in the shared database. FastAGI live-call discovery, idempotency, and
+performance correlation are scoped by the originating VICIdial `VARserver_ip`,
+preventing identical Asterisk unique IDs from different dialers from crossing
+node boundaries during selection.
 
 The package contains no server addresses or database credentials. Each dialer
 uses its existing VICIdial configuration, while schema installation connects
@@ -73,13 +80,15 @@ sudo ./install_did_optimizer.sh --role database
 Expected result:
 
 ```text
-Shared database schema ready (6 tables).
+Shared database schema ready (7 tables).
 ```
 
 The database role connects through the local MySQL socket. It does not require
 or discover a database IP address and does not store database credentials. It
 also downloads and imports `NPA_dataset.zip` into
 `did_optimizer_geo_prefixes` for NPA-NXX, city, state, and area-code matching.
+It rebuilds `did_optimizer_geo_npa_centroids` after the import so live calls can
+rank nearby area codes without aggregating the large postal-level table.
 
 ### 2. Dialer/web nodes
 
@@ -93,8 +102,14 @@ sudo ./install_did_optimizer.sh --role dialer
 The dialer role installs:
 
 - `/var/lib/asterisk/agi-bin/did_optimizer.agi`;
+- `/etc/systemd/system/did-optimizer-fastagi.service`;
 - `admin_did_optimizer_pool.php` in the detected VICIdial web directory; and
-- `/usr/local/share/did-optimizer/quick-test.sh` with its verification sources.
+- `/usr/local/share/did-optimizer/quick-test.sh` with its verification sources;
+  and
+- `/usr/local/sbin/uninstall-did-optimizer`.
+
+The installer enables and starts `did-optimizer-fastagi.service`. Its listener
+is restricted to `127.0.0.1:4578`; it is not exposed to other cluster nodes.
 
 No server address or database credential is passed to the installer. Dialer
 nodes read `VARserver_ip` and all `VARDB_*` settings from their existing
@@ -110,8 +125,8 @@ The cluster-compatible VICIdial admin page provides:
 - simple all-DID import with no area-code filtering or import quantity limit;
 - campaign-wide and per-DID daily limits;
 - reputation filtering and cached provider results;
-- Bayesian DID performance scores using recent call outcomes, duration, and
-  reputation;
+- Bayesian DID performance scores weighted by human-answer rate (45%), average
+  answered duration (35%), and reputation (20%);
 - cluster-node visibility for assignment history;
 - browser-persisted automatic refresh intervals; and
 - dismissible success and error toast notifications.
@@ -152,13 +167,17 @@ without deleting optimizer data. Do not pass `--clean` during an upgrade.
 The `--clean` option intentionally drops all optimizer tables, DID pools,
 assignment history, and campaign state before recreating them.
 
+For an existing installation, always run the database-role upgrade first and
+then upgrade every dialer. This ensures the centroid table and composite
+cluster identity index exist before the new FastAGI workers receive calls.
+
 ## Dialplan
 
 Add the optimizer after VICIdial's `call_log` AGI and before the carrier `Dial()`:
 
 ```asterisk
 exten => _YOURPATTERN,1,AGI(agi://127.0.0.1:4577/call_log)
-exten => _YOURPATTERN,2,AGI(did_optimizer.agi,${campaign_id},${dialed_number},${UNIQUEID},${lead_id})
+exten => _YOURPATTERN,2,AGI(agi://127.0.0.1:4578/did_optimizer,${campaign_id},${dialed_number},${UNIQUEID},${lead_id})
 exten => _YOURPATTERN,3,NoOp(DIDOPT server=${DIDOPT_SERVER_IP} status=${DIDOPT_STATUS} did=${DIDOPT_SELECTED} reason=${DIDOPT_REASON})
 exten => _YOURPATTERN,4,Dial(...)
 ```
@@ -175,11 +194,59 @@ sudo /usr/local/share/did-optimizer/quick-test.sh
 
 Run the test on every dialer/web node. It reads the shared database connection
 and local server identity from `/etc/astguiclient.conf`, then validates the Perl
-AGI and PHP deployments, all six tables and indexes, and active plus persistent
-dialplan integration.
+AGI and PHP deployments, FastAGI systemd service, uninstaller, all seven tables
+and indexes, centroid population, and active plus persistent dialplan
+integration.
 
 The database node does not need the dialer health test. Its schema is verified
 during `sudo ./install_did_optimizer.sh --role database`.
+
+## Scalability
+
+FastAGI workers keep database connections open and ping them only periodically.
+Raw per-DID performance metrics are cached for 30 seconds, while geography and
+database-version data are cached per worker. Candidate eligibility, negative
+reputation filtering, daily limits, LRU order, and the final transactional
+recheck still run against current shared-database state for every call.
+
+The default service starts 16 workers and accepts a backlog of 256 connections.
+This is a safe starting point, not a guaranteed CPS rating. Traffic near 126
+calls per second must be load-tested with the actual campaign distribution,
+database latency, pool sizes, and call-history volume. Calls in one campaign
+still serialize briefly through that campaign's concurrency row; distributing
+traffic across campaigns allows independent locks.
+
+The one-shot `AGI(did_optimizer.agi,...)` entrypoint remains available for
+diagnostics and backwards compatibility, but it cannot reuse connections or
+in-memory caches and is not recommended for high call rates.
+
+## Uninstall
+
+The installer places the uninstaller at
+`/usr/local/sbin/uninstall-did-optimizer`. Removing one dialer preserves all
+shared optimizer data:
+
+```bash
+sudo uninstall-did-optimizer --role dialer
+```
+
+Permanently deleting the shared schema requires the explicit `--purge-data`
+option and a typed `DROP asterisk` confirmation:
+
+```bash
+sudo uninstall-did-optimizer --role database --purge-data
+```
+
+For a combined dialer/database node:
+
+```bash
+sudo uninstall-did-optimizer --role all --purge-data
+```
+
+Use `--yes` with `--purge-data` only for deliberate non-interactive automation.
+The uninstaller stops FastAGI and removes only known optimizer files. It never
+edits Asterisk configuration; remove the optimizer line from the VICIdial
+carrier Dialplan Entry and rebuild/reload the dialplan separately.
 
 The NPA-NXX dataset is redistributed by the original DID Optimizer project
 from [djbelieny/geoinfo-dataset](https://github.com/djbelieny/geoinfo-dataset)
@@ -187,9 +254,10 @@ under the MIT License.
 
 ## Runtime configuration
 
-The AGI reads VICIdial database settings from `/etc/astguiclient.conf`. The
-installer deploys `did_optimizer.agi` to
-`/var/lib/asterisk/agi-bin/did_optimizer.agi`.
+Each FastAGI worker reads VICIdial database settings from
+`/etc/astguiclient.conf` and reuses its connection. The installer deploys the
+runtime to `/var/lib/asterisk/agi-bin/did_optimizer.agi` and manages it through
+`did-optimizer-fastagi.service`.
 
 Required dialer configuration keys are:
 

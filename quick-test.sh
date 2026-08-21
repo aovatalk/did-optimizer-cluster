@@ -9,6 +9,7 @@ FASTAGI_SERVICE_SOURCE="$SCRIPT_DIR/did-optimizer-fastagi.service"
 PHP_SOURCE="$SCRIPT_DIR/admin_did_optimizer_pool.php"
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
 FASTAGI_SERVICE_TARGET="/etc/systemd/system/did-optimizer-fastagi.service"
+UNINSTALL_TARGET="/usr/local/sbin/uninstall-did-optimizer"
 PHP_TARGET=""
 MYSQL_DEFAULTS_FILE=""
 
@@ -104,9 +105,15 @@ else
 fi
 
 for required_file in "$AGI_SOURCE" "$FASTAGI_SERVICE_SOURCE" "$PHP_SOURCE" \
-                     "$AGI_TARGET" "$FASTAGI_SERVICE_TARGET" "$PHP_TARGET"; do
+                     "$AGI_TARGET" "$FASTAGI_SERVICE_TARGET" "$UNINSTALL_TARGET" "$PHP_TARGET"; do
     check_file "$required_file"
 done
+
+if [[ -x "$UNINSTALL_TARGET" ]]; then
+    pass 'cluster-safe uninstaller is installed and executable'
+else
+    fail 'cluster-safe uninstaller is missing or non-executable'
+fi
 
 if [[ -r "$AGI_SOURCE" ]] \
     && [[ $(head -n 1 "$AGI_SOURCE") == '#!/usr/bin/perl' ]] \
