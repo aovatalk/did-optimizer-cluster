@@ -8,8 +8,10 @@ SQL_SOURCE="$SCRIPT_DIR/did_optimizer.sql"
 AGI_SOURCE="$SCRIPT_DIR/did_optimizer.agi"
 PHP_SOURCE="$SCRIPT_DIR/admin_did_optimizer_pool.php"
 QUICK_TEST_SOURCE="$SCRIPT_DIR/quick-test.sh"
+FASTAGI_SERVICE_SOURCE="$SCRIPT_DIR/did-optimizer-fastagi.service"
 DB_NAME="asterisk"
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
+FASTAGI_SERVICE_TARGET="/etc/systemd/system/did-optimizer-fastagi.service"
 MAINTENANCE_DIR="/usr/local/share/did-optimizer"
 ROLE=""
 CLEAN_INSTALL=0
@@ -91,6 +93,7 @@ if [[ "$ROLE" == 'database' ]]; then
     download_url_file NPA_dataset.zip "$GEO_DATASET_URL"
 else
     download_source_file did_optimizer.agi
+    download_source_file did-optimizer-fastagi.service
     download_source_file admin_did_optimizer_pool.php
     download_source_file quick-test.sh
 fi
@@ -108,6 +111,7 @@ install_database() {
             "DROP TABLE IF EXISTS did_optimizer_assignments;
              DROP TABLE IF EXISTS did_optimizer_campaign_state;
              DROP TABLE IF EXISTS did_optimizer_pool;
+             DROP TABLE IF EXISTS did_optimizer_geo_npa_centroids;
              DROP TABLE IF EXISTS did_optimizer_geo_prefixes;
              DROP TABLE IF EXISTS did_optimizer_reputation_cache;
              DROP TABLE IF EXISTS did_optimizer_settings;"
@@ -160,6 +164,13 @@ install_database() {
     [[ "$geo_count" =~ ^[0-9]+$ && "$geo_count" -gt 0 ]] \
         || die 'NPA-NXX geographic dataset import produced no rows.'
     printf 'Geographic prefix dataset ready (%s rows).\n' "$geo_count"
+    mysql --protocol=socket --database="$DB_NAME" -e \
+        "TRUNCATE TABLE did_optimizer_geo_npa_centroids;
+         INSERT INTO did_optimizer_geo_npa_centroids (npa, latitude, longitude)
+         SELECT npa, AVG(latitude), AVG(longitude)
+           FROM did_optimizer_geo_prefixes
+          WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+          GROUP BY npa;"
 
     # Upgrade installations made by the original three-table release.
     column_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
@@ -229,9 +240,10 @@ install_database() {
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments',
               'did_optimizer_campaign_state','did_optimizer_geo_prefixes',
+              'did_optimizer_geo_npa_centroids',
               'did_optimizer_reputation_cache','did_optimizer_settings');")
-    [[ "$table_count" == '6' ]] \
-        || die "Schema verification failed: expected 6 optimizer tables, found $table_count"
+    [[ "$table_count" == '7' ]] \
+        || die "Schema verification failed: expected 7 optimizer tables, found $table_count"
     printf 'Shared database schema ready (%s tables).\n' "$table_count"
 }
 
@@ -243,8 +255,10 @@ install_dialer() {
     require_command awk
     require_command perl
     require_command grep
-    [[ -r "$AGI_SOURCE" && -r "$PHP_SOURCE" && -r "$QUICK_TEST_SOURCE" ]] \
-        || die 'AGI, PHP, or quick-test source is missing.'
+    require_command systemctl
+    [[ -r "$AGI_SOURCE" && -r "$FASTAGI_SERVICE_SOURCE" \
+       && -r "$PHP_SOURCE" && -r "$QUICK_TEST_SOURCE" ]] \
+        || die 'AGI, FastAGI service, PHP, or quick-test source is missing.'
     vicidial_path=$(find_vicidial_path) \
         || die 'VICIdial web installation not found in the supported web roots.'
     php_target="$vicidial_path/admin_did_optimizer_pool.php"
@@ -257,9 +271,11 @@ install_dialer() {
     perl -c "$AGI_SOURCE"
     php -l "$PHP_SOURCE"
     install -o asterisk -g asterisk -m 0750 "$AGI_SOURCE" "$AGI_TARGET"
+    install -o root -g root -m 0644 "$FASTAGI_SERVICE_SOURCE" "$FASTAGI_SERVICE_TARGET"
     install -o root -g root -m 0755 "$PHP_SOURCE" "$php_target"
     install -d -o root -g root -m 0755 "$MAINTENANCE_DIR"
     install -o root -g root -m 0644 "$AGI_SOURCE" "$MAINTENANCE_DIR/did_optimizer.agi"
+    install -o root -g root -m 0644 "$FASTAGI_SERVICE_SOURCE" "$MAINTENANCE_DIR/did-optimizer-fastagi.service"
     install -o root -g root -m 0644 "$PHP_SOURCE" "$MAINTENANCE_DIR/admin_did_optimizer_pool.php"
     install -o root -g root -m 0755 "$QUICK_TEST_SOURCE" "$MAINTENANCE_DIR/quick-test.sh"
     perl -c "$AGI_TARGET"
@@ -271,7 +287,11 @@ install_dialer() {
     target_php_hash=$(sha256sum "$php_target" | awk '{print $1}')
     [[ "$source_agi_hash" == "$target_agi_hash" ]] || die 'Installed AGI hash mismatch.'
     [[ "$source_php_hash" == "$target_php_hash" ]] || die 'Installed PHP hash mismatch.'
-    printf 'Dialer/web node ready: AGI=%s admin=%s test=%s/quick-test.sh\n' \
+    systemctl daemon-reload
+    systemctl enable --now did-optimizer-fastagi.service
+    systemctl is-active --quiet did-optimizer-fastagi.service \
+        || die 'DID optimizer FastAGI service did not start.'
+    printf 'Dialer/web node ready: FastAGI=%s admin=%s test=%s/quick-test.sh\n' \
         "$AGI_TARGET" "$php_target" "$MAINTENANCE_DIR"
 }
 
@@ -285,5 +305,5 @@ printf '%s\n' \
     '  Dialplan: unchanged' \
     '' \
     'Add after call_log and immediately before Dial() on every dialer node:' \
-    ' same => n,AGI(did_optimizer.agi,${campaign_id},${dialed_number},${UNIQUEID},${lead_id})' \
+    ' same => n,AGI(agi://127.0.0.1:4578/did_optimizer,${campaign_id},${dialed_number},${UNIQUEID},${lead_id})' \
     ' same => n,NoOp(DID optimizer: ${DIDOPT_STATUS} ${DIDOPT_SELECTED} ${DIDOPT_REASON})'

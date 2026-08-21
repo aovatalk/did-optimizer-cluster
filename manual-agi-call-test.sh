@@ -46,7 +46,7 @@ done
 
 dialed_number="${prefix}${destination}"
 if ! asterisk -rx "dialplan show _${prefix}X.@default" 2>/dev/null \
-    | grep -Fq 'did_optimizer.agi'; then
+    | grep -Eq 'did_optimizer\.agi|agi://127\.0\.0\.1:4578/did_optimizer'; then
     fail "no active DID optimizer dialplan route found for prefix $prefix"
 fi
 

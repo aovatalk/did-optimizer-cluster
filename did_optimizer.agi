@@ -6,6 +6,8 @@
 use strict;
 use warnings;
 use DBI;
+use Getopt::Long qw(GetOptionsFromArray);
+use IO::Socket::INET;
 
 $| = 1;
 
@@ -17,6 +19,13 @@ my $DB_READ_TIMEOUT     = 5;
 my $DB_WRITE_TIMEOUT    = 5;
 my $DB_LOCK_TIMEOUT     = 3;
 my $AGI_TIMEOUT         = 10;
+my $PERFORMANCE_CACHE_TTL = 30;
+my $PERFORMANCE_CACHE_MAX = 5000;
+my $GEO_CACHE_MAX        = 2000;
+my $DB_PING_INTERVAL    = 5;
+my $FASTAGI_LISTEN      = '127.0.0.1';
+my $FASTAGI_PORT        = 4578;
+my $FASTAGI_WORKERS     = 16;
 my $MAX_CANDIDATES      = 100;
 my $MAX_SAMPLE_SIZE     = 20;
 my $MIN_SUCCESS_DURATION = 5; # A successful call must be strictly greater than this.
@@ -29,10 +38,18 @@ my $REPUTATION_WEIGHT    = 0.20;
 
 my $dbh;
 my $agi_ready = 0;
+my $agi_in = \*STDIN;
+my $agi_out = \*STDOUT;
+my $persistent_mode = 0;
+my $cached_config;
+my $last_db_ping = 0;
+my $window_functions_supported;
+my %performance_cache;
+my %geo_profile_cache;
 
 sub read_agi_environment {
     my %agi;
-    while (defined(my $line = <STDIN>)) {
+    while (defined(my $line = <$agi_in>)) {
         $line =~ s/[\r\n]+$//;
         last if $line eq '';
         if ($line =~ /^agi_([^:]+):\s*(.*)$/) {
@@ -56,8 +73,8 @@ sub agi_command {
     my ($command) = @_;
     return (undef, 'AGI environment not available') unless $agi_ready;
 
-    print STDOUT $command . "\n";
-    my $response = <STDIN>;
+    print {$agi_out} $command . "\n";
+    my $response = <$agi_in>;
     return (undef, 'No response from Asterisk') unless defined $response;
     $response =~ s/[\r\n]+$//;
 
@@ -151,6 +168,24 @@ sub connect_database {
     # Do not let a blocked cluster transaction hold a live outbound channel for
     # the server's much longer default InnoDB lock-wait timeout.
     $dbh->do('SET SESSION innodb_lock_wait_timeout = ' . int($DB_LOCK_TIMEOUT)) if $dbh;
+    return $dbh;
+}
+
+sub get_database {
+    my ($config) = @_;
+    if ($persistent_mode && $dbh) {
+        my $now = time();
+        return $dbh if ($now - $last_db_ping) < $DB_PING_INTERVAL;
+        if (eval { $dbh->ping() }) {
+            $last_db_ping = $now;
+            return $dbh;
+        }
+        eval { $dbh->disconnect(); };
+        $dbh = undef;
+    }
+
+    $dbh = connect_database($config);
+    $last_db_ping = time();
     return $dbh;
 }
 
@@ -385,24 +420,46 @@ sub get_preferred_candidate_dids {
 sub get_geo_profiles {
     my ($db, $numbers) = @_;
     my %prefixes = map { my $p = get_npanxx($_); $p ? ($p => 1) : () } @$numbers;
-    my %npas = map { substr($_, 0, 3) => 1 } keys %prefixes;
     my %profiles;
     return \%profiles unless keys %prefixes;
 
-    for my $prefix (keys %prefixes) {
+    my @prefix_list = sort keys %prefixes;
+    my @missing_prefixes;
+    if ($persistent_mode) {
+        for my $prefix (@prefix_list) {
+            if ($geo_profile_cache{$prefix}) {
+                $profiles{$prefix} = $geo_profile_cache{$prefix};
+            }
+            else {
+                push @missing_prefixes, $prefix;
+            }
+        }
+        if (scalar(keys %geo_profile_cache) + scalar(@missing_prefixes) > $GEO_CACHE_MAX) {
+            %geo_profile_cache = ();
+            %profiles = ();
+            @missing_prefixes = @prefix_list;
+        }
+        return \%profiles unless @missing_prefixes;
+    }
+    else {
+        @missing_prefixes = @prefix_list;
+    }
+
+    my %npas = map { substr($_, 0, 3) => 1 } @missing_prefixes;
+
+    for my $prefix (@missing_prefixes) {
         $profiles{$prefix} = {
             npanxx => $prefix, npa => substr($prefix, 0, 3),
             cities => {}, states => {}, countries => {},
         };
     }
 
-    my @prefix_list = sort keys %prefixes;
-    my $placeholders = join(',', ('?') x scalar(@prefix_list));
+    my $placeholders = join(',', ('?') x scalar(@missing_prefixes));
     my $rows = $db->selectall_arrayref(
         qq{SELECT npanxx, npa, LOWER(city) AS city, state_iso, country_iso
              FROM did_optimizer_geo_prefixes
             WHERE npanxx IN ($placeholders)},
-        { Slice => {} }, @prefix_list
+        { Slice => {} }, @missing_prefixes
     );
     for my $row (@$rows) {
         my $profile = $profiles{$row->{'npanxx'}};
@@ -453,6 +510,11 @@ sub get_geo_profiles {
         @{$profile->{'countries'}}{keys %{$fallback->{'countries'} || {}}} = (1) x scalar(keys %{$fallback->{'countries'} || {}});
         @{$profile->{'states'}}{keys %{$fallback->{'states'} || {}}} = (1) x scalar(keys %{$fallback->{'states'} || {}});
     }
+    if ($persistent_mode) {
+        for my $prefix (@missing_prefixes) {
+            $geo_profile_cache{$prefix} = $profiles{$prefix};
+        }
+    }
     return \%profiles;
 }
 
@@ -490,12 +552,49 @@ sub get_best_geo_pool {
 
 sub database_supports_window_functions {
     my ($db) = @_;
+    return $window_functions_supported
+        if $persistent_mode && defined $window_functions_supported;
     my ($version) = $db->selectrow_array('SELECT VERSION()');
     $version ||= '';
     if ($version =~ /MariaDB/i) {
-        return ($version =~ /^(\d+)\.(\d+)/ && ($1 > 10 || ($1 == 10 && $2 >= 2))) ? 1 : 0;
+        my $supported = ($version =~ /^(\d+)\.(\d+)/ && ($1 > 10 || ($1 == 10 && $2 >= 2))) ? 1 : 0;
+        $window_functions_supported = $supported if $persistent_mode;
+        return $supported;
     }
-    return ($version =~ /^(\d+)\.(\d+)/ && $1 >= 8) ? 1 : 0;
+    my $supported = ($version =~ /^(\d+)\.(\d+)/ && $1 >= 8) ? 1 : 0;
+    $window_functions_supported = $supported if $persistent_mode;
+    return $supported;
+}
+
+sub raw_metric_copy {
+    my ($metric) = @_;
+    return {
+        sample_size               => ($metric->{'sample_size'} || 0) + 0,
+        human_answered_calls      => ($metric->{'human_answered_calls'} || 0) + 0,
+        good_calls                => ($metric->{'good_calls'} || 0) + 0,
+        human_answer_rate         => ($metric->{'human_answer_rate'} || 0) + 0,
+        good_call_rate            => ($metric->{'good_call_rate'} || 0) + 0,
+        average_answered_duration => ($metric->{'average_answered_duration'} || 0) + 0,
+    };
+}
+
+sub prune_performance_cache {
+    my $entry_count = scalar(keys %performance_cache);
+    return unless $entry_count > $PERFORMANCE_CACHE_MAX;
+    my $cutoff = time() - $PERFORMANCE_CACHE_TTL;
+    for my $key (keys %performance_cache) {
+        delete $performance_cache{$key}
+            if $performance_cache{$key}->{'fetched_at'} < $cutoff;
+    }
+    $entry_count = scalar(keys %performance_cache);
+    if ($entry_count > $PERFORMANCE_CACHE_MAX) {
+        my @oldest = sort {
+            $performance_cache{$a}->{'fetched_at'}
+                <=> $performance_cache{$b}->{'fetched_at'}
+        } keys %performance_cache;
+        my $remove_count = $entry_count - $PERFORMANCE_CACHE_MAX;
+        delete @performance_cache{@oldest[0 .. $remove_count - 1]};
+    }
 }
 
 # VICIdial-version-specific completed-call mapping is isolated here.
@@ -506,7 +605,15 @@ sub database_supports_window_functions {
 sub get_completed_call_results {
     my ($db, $campaign, $dids) = @_;
     my %stats;
+    my @query_dids;
+    my $now = time();
     for my $did (@$dids) {
+        my $cache_key = "$campaign\x1f$did";
+        my $cached = $persistent_mode ? $performance_cache{$cache_key} : undef;
+        if ($cached && ($now - $cached->{'fetched_at'}) < $PERFORMANCE_CACHE_TTL) {
+            $stats{$did} = raw_metric_copy($cached->{'metric'});
+            next;
+        }
         $stats{$did} = {
             sample_size              => 0,
             human_answered_calls     => 0,
@@ -515,10 +622,11 @@ sub get_completed_call_results {
             good_call_rate           => 0,
             average_answered_duration => 0,
         };
+        push @query_dids, $did;
     }
-    return \%stats unless @$dids;
+    return \%stats unless @query_dids;
 
-    my $placeholders = join(',', ('?') x scalar(@$dids));
+    my $placeholders = join(',', ('?') x scalar(@query_dids));
     my $human_sql = q{
         COALESCE(
             (SELECT vcs.human_answered
@@ -565,7 +673,7 @@ sub get_completed_call_results {
              WHERE sample_rank <= ?
              GROUP BY did_number
         };
-        @bind = ($MIN_SUCCESS_DURATION, $campaign, @$dids, $MAX_SAMPLE_SIZE);
+        @bind = ($MIN_SUCCESS_DURATION, $campaign, @query_dids, $MAX_SAMPLE_SIZE);
     }
     else {
         # Compatible path for older MySQL/MariaDB versions without ROW_NUMBER().
@@ -580,7 +688,7 @@ sub get_completed_call_results {
         # much history a DID accumulates over time).
         my @branches;
         @bind = ($MIN_SUCCESS_DURATION);
-        for my $did (@$dids) {
+        for my $did (@query_dids) {
             push @branches, qq{
                 (SELECT a.did_number,
                         COALESCE(v.length_in_sec, 0) AS length_in_sec,
@@ -622,6 +730,16 @@ sub get_completed_call_results {
             good_call_rate            => $sample ? $good / $sample : 0,
             average_answered_duration => ($row->{'average_answered_duration'} || 0) + 0,
         };
+    }
+    if ($persistent_mode) {
+        for my $did (@query_dids) {
+            my $cache_key = "$campaign\x1f$did";
+            $performance_cache{$cache_key} = {
+                fetched_at => $now,
+                metric     => raw_metric_copy($stats{$did}),
+            };
+        }
+        prune_performance_cache();
     }
     return \%stats;
 }
@@ -904,12 +1022,22 @@ sub publish_success_variables {
 
 sub main {
     my $agi = read_agi_environment();
-    my @args = @ARGV;
+    my @args;
+    if ($persistent_mode) {
+        my $arg_number = 1;
+        while (exists $agi->{"arg_$arg_number"}) {
+            push @args, $agi->{"arg_$arg_number"};
+            $arg_number++;
+        }
+    }
+    else {
+        @args = @ARGV;
+    }
 
-    my $config = load_vicidial_config($CONFIG_FILE);
+    my $config = $cached_config ||= load_vicidial_config($CONFIG_FILE);
     abort_request('NO_SERVER', "Missing VARserver_ip in $CONFIG_FILE")
         unless defined $config->{'VARserver_ip'} && $config->{'VARserver_ip'} ne '';
-    $dbh = connect_database($config);
+    $dbh = get_database($config);
     die 'Database connection returned no handle' unless $dbh;
 
     my $call = find_current_call($dbh, $agi, \@args, $config->{'VARserver_ip'});
@@ -969,43 +1097,139 @@ sub main {
 
     publish_success_variables($call, $selected, $metrics, $decision, $destination_npanxx);
     agi_verbose("callerid committed DID=$selected->{'did_number'}", 0);
-    $dbh->disconnect();
-    $dbh = undef;
+    unless ($persistent_mode) {
+        $dbh->disconnect();
+        $dbh = undef;
+    }
     return 1;
 }
 
-my $ok = eval {
-    local $SIG{'ALRM'} = sub {
-        die "DIDOPT_ABORT|DB_TIMEOUT|AGI database deadline exceeded\n";
+sub process_request {
+    $agi_ready = 0;
+    my $ok = eval {
+        local $SIG{'ALRM'} = sub {
+            die "DIDOPT_ABORT|DB_TIMEOUT|AGI database deadline exceeded\n";
+        };
+        alarm($AGI_TIMEOUT);
+        main();
+        alarm(0);
+        1;
     };
-    alarm($AGI_TIMEOUT);
-    main();
     alarm(0);
-    1;
-};
-alarm(0);
-if (!$ok) {
-    my $error = $@ || 'Unknown error';
-    eval {
-        $dbh->rollback() if $dbh && !$dbh->{'AutoCommit'};
-    };
+    if (!$ok) {
+        my $error = $@ || 'Unknown error';
+        eval {
+            $dbh->rollback() if $dbh && !$dbh->{'AutoCommit'};
+        };
 
-    my ($status, $message) = ('ERROR', $error);
-    if ($error =~ /^DIDOPT_ABORT\|([^|]+)\|(.*?)(?:\n|$)/s) {
-        ($status, $message) = ($1, $2);
-    }
-    elsif ($error =~ /DBI|database|SQL|prepare|execute|connect/i) {
-        $status = 'DB_ERROR';
-    }
-    $message =~ s/[\r\n]+/ /g;
-    $message =~ s/\s+at\s+\S+\s+line\s+\d+.*$//;
-    $message = substr($message, 0, 180);
-    set_failure_status($status, $message);
+        my ($status, $message) = ('ERROR', $error);
+        if ($error =~ /^DIDOPT_ABORT\|([^|]+)\|(.*?)(?:\n|$)/s) {
+            ($status, $message) = ($1, $2);
+        }
+        elsif ($error =~ /DBI|database|SQL|prepare|execute|connect/i) {
+            $status = 'DB_ERROR';
+        }
+        $message =~ s/[\r\n]+/ /g;
+        $message =~ s/\s+at\s+\S+\s+line\s+\d+.*$//;
+        $message = substr($message, 0, 180);
+        set_failure_status($status, $message);
 
-    eval { $dbh->disconnect() if $dbh; };
-    $dbh = undef;
+        # A failed statement can leave a persistent DB handle out of sync or
+        # inside an aborted transaction. Reconnect cleanly on the next call.
+        eval { $dbh->disconnect() if $dbh; };
+        $dbh = undef;
+        $last_db_ping = 0;
+    }
+    return $ok ? 1 : 0;
 }
 
-# Always exit cleanly. Failures leave the pre-existing caller ID untouched and
-# allow the dialplan to continue to its normal Dial() application.
+sub fastagi_worker {
+    my ($listener) = @_;
+    $persistent_mode = 1;
+    $SIG{'PIPE'} = 'IGNORE';
+    $SIG{'TERM'} = $SIG{'INT'} = sub {
+        eval { $dbh->disconnect() if $dbh; };
+        exit 0;
+    };
+
+    while (my $client = $listener->accept()) {
+        $client->autoflush(1);
+        $agi_in = $client;
+        $agi_out = $client;
+        process_request();
+        close($client);
+        $agi_in = \*STDIN;
+        $agi_out = \*STDOUT;
+    }
+    exit 0;
+}
+
+sub spawn_fastagi_worker {
+    my ($listener) = @_;
+    my $pid = fork();
+    die 'Could not fork FastAGI worker' unless defined $pid;
+    fastagi_worker($listener) unless $pid;
+    return $pid;
+}
+
+sub run_fastagi {
+    my (@options) = @_;
+    my ($listen, $port, $workers) = (
+        $FASTAGI_LISTEN, $FASTAGI_PORT, $FASTAGI_WORKERS
+    );
+    GetOptionsFromArray(
+        \@options,
+        'listen=s'  => \$listen,
+        'port=i'    => \$port,
+        'workers=i' => \$workers,
+    ) or die 'Invalid FastAGI options';
+    die 'Unexpected FastAGI argument' if @options;
+    die 'Invalid FastAGI listen address'
+        unless $listen eq '127.0.0.1';
+    die 'Invalid FastAGI port' unless $port >= 1024 && $port <= 65535;
+    die 'Invalid FastAGI worker count' unless $workers >= 1 && $workers <= 128;
+
+    my $listener = IO::Socket::INET->new(
+        LocalAddr => $listen,
+        LocalPort => $port,
+        Proto     => 'tcp',
+        Listen    => 256,
+        ReuseAddr => 1,
+    ) or die "Could not listen on $listen:$port: $!";
+
+    my %children;
+    for (1 .. $workers) {
+        my $pid = spawn_fastagi_worker($listener);
+        $children{$pid} = 1;
+    }
+
+    my $stopping = 0;
+    $SIG{'TERM'} = $SIG{'INT'} = sub {
+        $stopping = 1;
+        kill 'TERM', keys %children if %children;
+    };
+    while (!$stopping || %children) {
+        my $pid = wait();
+        next if $pid < 1 && !$stopping;
+        last if $pid < 1;
+        delete $children{$pid};
+        if (!$stopping) {
+            my $replacement = spawn_fastagi_worker($listener);
+            $children{$replacement} = 1;
+        }
+    }
+    close($listener);
+    return 1;
+}
+
+if (@ARGV && $ARGV[0] eq '--fastagi') {
+    shift @ARGV;
+    run_fastagi(@ARGV);
+    exit 0;
+}
+
+# One-shot AGI compatibility remains available for existing dialplans.
+# Failures leave the pre-existing caller ID untouched and exit cleanly so the
+# dialplan can continue to its normal Dial() application.
+process_request();
 exit 0;

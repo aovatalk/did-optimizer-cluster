@@ -1,0 +1,20 @@
+[Unit]
+Description=VICIdial DID Optimizer FastAGI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=asterisk
+Group=asterisk
+ExecStart=/var/lib/asterisk/agi-bin/did_optimizer.agi --fastagi --listen 127.0.0.1 --port 4578 --workers 16
+Restart=always
+RestartSec=1
+TimeoutStopSec=10
+KillMode=mixed
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

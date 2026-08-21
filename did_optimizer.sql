@@ -81,6 +81,18 @@ CREATE TABLE IF NOT EXISTS did_optimizer_geo_prefixes (
     KEY idx_didopt_geo_state (state_iso, country_iso)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
 
+-- Materialized NPA centroids keep nearest-area selection off the large
+-- postal-level prefix table during live calls. The database installer rebuilds
+-- this table after every geographic dataset refresh.
+CREATE TABLE IF NOT EXISTS did_optimizer_geo_npa_centroids (
+    npa CHAR(3) NOT NULL,
+    latitude DECIMAL(10,6) NOT NULL,
+    longitude DECIMAL(10,6) NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (npa)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS did_optimizer_reputation_cache (
     did_number VARCHAR(32) NOT NULL,
     reputation VARCHAR(32) DEFAULT NULL,

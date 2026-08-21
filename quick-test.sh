@@ -5,8 +5,10 @@ set -uo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DB_NAME="asterisk"
 AGI_SOURCE="$SCRIPT_DIR/did_optimizer.agi"
+FASTAGI_SERVICE_SOURCE="$SCRIPT_DIR/did-optimizer-fastagi.service"
 PHP_SOURCE="$SCRIPT_DIR/admin_did_optimizer_pool.php"
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
+FASTAGI_SERVICE_TARGET="/etc/systemd/system/did-optimizer-fastagi.service"
 PHP_TARGET=""
 MYSQL_DEFAULTS_FILE=""
 
@@ -76,7 +78,7 @@ else
     PHP_TARGET='/__didopt_vicidial_not_found__/admin_did_optimizer_pool.php'
 fi
 
-for command_name in php mysql sha256sum stat grep cmp runuser perl awk mktemp; do
+for command_name in php mysql sha256sum stat grep cmp runuser perl awk mktemp systemctl; do
     check_command "$command_name"
 done
 
@@ -101,7 +103,8 @@ else
     fail '/etc/astguiclient.conf is not readable'
 fi
 
-for required_file in "$AGI_SOURCE" "$PHP_SOURCE" "$AGI_TARGET" "$PHP_TARGET"; do
+for required_file in "$AGI_SOURCE" "$FASTAGI_SERVICE_SOURCE" "$PHP_SOURCE" \
+                     "$AGI_TARGET" "$FASTAGI_SERVICE_TARGET" "$PHP_TARGET"; do
     check_file "$required_file"
 done
 
@@ -139,6 +142,13 @@ else
     fail 'deployed AGI differs from workspace source'
 fi
 
+if [[ -f "$FASTAGI_SERVICE_SOURCE" && -f "$FASTAGI_SERVICE_TARGET" ]] \
+    && cmp -s "$FASTAGI_SERVICE_SOURCE" "$FASTAGI_SERVICE_TARGET"; then
+    pass 'deployed FastAGI service matches workspace source'
+else
+    fail 'deployed FastAGI service differs from workspace source'
+fi
+
 if [[ -f "$PHP_SOURCE" && -f "$PHP_TARGET" ]] && cmp -s "$PHP_SOURCE" "$PHP_TARGET"; then
     pass 'deployed PHP matches workspace source'
 else
@@ -159,6 +169,17 @@ if [[ -f "$PHP_TARGET" ]]; then
         || fail "PHP ownership/mode expected root:root 755, got: ${php_identity:-unknown}"
 fi
 
+if systemctl is-active --quiet did-optimizer-fastagi.service; then
+    pass 'DID optimizer FastAGI service is active'
+else
+    fail 'DID optimizer FastAGI service is not active'
+fi
+if systemctl is-enabled --quiet did-optimizer-fastagi.service; then
+    pass 'DID optimizer FastAGI service starts at boot'
+else
+    fail 'DID optimizer FastAGI service is not enabled'
+fi
+
 if runuser -u asterisk -- test -r /etc/astguiclient.conf; then
     pass 'Asterisk service account can read astguiclient.conf'
 else
@@ -172,19 +193,21 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
         "SELECT COUNT(*) FROM information_schema.TABLES
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments','did_optimizer_campaign_state',
-              'did_optimizer_geo_prefixes','did_optimizer_reputation_cache','did_optimizer_settings');" 2>/dev/null)
-    [[ "$table_count" == '6' ]] \
-        && pass 'all six optimizer tables exist' \
-        || fail "expected 6 optimizer tables, found ${table_count:-unknown}"
+              'did_optimizer_geo_prefixes','did_optimizer_geo_npa_centroids',
+              'did_optimizer_reputation_cache','did_optimizer_settings');" 2>/dev/null)
+    [[ "$table_count" == '7' ]] \
+        && pass 'all seven optimizer tables exist' \
+        || fail "expected 7 optimizer tables, found ${table_count:-unknown}"
 
     engine_count=$(mysql_db --batch --skip-column-names -e \
         "SELECT COUNT(*) FROM information_schema.TABLES
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments','did_optimizer_campaign_state',
-              'did_optimizer_geo_prefixes','did_optimizer_reputation_cache','did_optimizer_settings')
+              'did_optimizer_geo_prefixes','did_optimizer_geo_npa_centroids',
+              'did_optimizer_reputation_cache','did_optimizer_settings')
             AND ENGINE='InnoDB'
             AND TABLE_COLLATION IN ('utf8_unicode_ci','utf8mb3_unicode_ci');" 2>/dev/null)
-    [[ "$engine_count" == '6' ]] \
+    [[ "$engine_count" == '7' ]] \
         && pass 'all optimizer tables use InnoDB and a compatible utf8 Unicode collation' \
         || {
             fail 'one or more optimizer tables has the wrong engine or collation'
@@ -195,6 +218,7 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
                   WHERE TABLE_SCHEMA='$DB_NAME'
                     AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments',
                       'did_optimizer_campaign_state','did_optimizer_geo_prefixes',
+                      'did_optimizer_geo_npa_centroids',
                       'did_optimizer_reputation_cache','did_optimizer_settings')
                   ORDER BY TABLE_NAME;" 2>/dev/null || true)
             while IFS= read -r storage_line; do
@@ -219,12 +243,13 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
               OR (TABLE_NAME='did_optimizer_geo_prefixes' AND INDEX_NAME IN
                     ('PRIMARY','uq_didopt_geo_exchange_postal','idx_didopt_geo_npanxx',
                      'idx_didopt_geo_npa','idx_didopt_geo_city_state','idx_didopt_geo_state'))
+              OR (TABLE_NAME='did_optimizer_geo_npa_centroids' AND INDEX_NAME='PRIMARY')
               OR (TABLE_NAME='did_optimizer_reputation_cache' AND INDEX_NAME IN
                     ('PRIMARY','idx_didopt_reputation_freshness','idx_didopt_reputation_checked'))
               OR (TABLE_NAME='did_optimizer_settings' AND INDEX_NAME='PRIMARY'));" 2>/dev/null)
-    [[ "$index_count" == '20' ]] \
+    [[ "$index_count" == '21' ]] \
         && pass 'all required optimizer indexes exist' \
-        || fail "expected 20 required indexes, found ${index_count:-unknown}"
+        || fail "expected 21 required indexes, found ${index_count:-unknown}"
 
     reputation_column_count=$(mysql_db --batch --skip-column-names -e \
         "SELECT COUNT(*) FROM information_schema.COLUMNS
@@ -238,7 +263,8 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
         "SELECT CONCAT('pool=', (SELECT COUNT(*) FROM did_optimizer_pool),
                        ' assignments=', (SELECT COUNT(*) FROM did_optimizer_assignments),
                        ' campaign_state=', (SELECT COUNT(*) FROM did_optimizer_campaign_state),
-                       ' geo_prefixes=', (SELECT COUNT(*) FROM did_optimizer_geo_prefixes));" 2>/dev/null || true)
+                       ' geo_prefixes=', (SELECT COUNT(*) FROM did_optimizer_geo_prefixes),
+                       ' geo_centroids=', (SELECT COUNT(*) FROM did_optimizer_geo_npa_centroids));" 2>/dev/null || true)
     [[ -n "$row_summary" ]] && pass "table queries succeed ($row_summary)" \
         || fail 'could not query optimizer table row counts'
     geo_prefix_count=$(mysql_db --batch --skip-column-names -e \
@@ -246,17 +272,22 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
     [[ "$geo_prefix_count" =~ ^[0-9]+$ && "$geo_prefix_count" -gt 0 ]] \
         && pass "NPA-NXX geographic dataset is populated ($geo_prefix_count rows)" \
         || fail 'NPA-NXX geographic dataset is empty'
+    geo_centroid_count=$(mysql_db --batch --skip-column-names -e \
+        'SELECT COUNT(*) FROM did_optimizer_geo_npa_centroids;' 2>/dev/null || true)
+    [[ "$geo_centroid_count" =~ ^[0-9]+$ && "$geo_centroid_count" -gt 0 ]] \
+        && pass "NPA centroid cache is populated ($geo_centroid_count rows)" \
+        || fail 'NPA centroid cache is empty'
 else
     fail "MySQL connection to $DB_NAME"
 fi
 
 if command -v asterisk >/dev/null 2>&1; then
     dialplan_output=$(asterisk -rx 'dialplan show' 2>/dev/null || true)
-    if grep -Fq 'AGI(did_optimizer.agi' <<< "$dialplan_output"; then
-        active_dialplan_lines=$(grep -Fc 'AGI(did_optimizer.agi' <<< "$dialplan_output")
-        pass "DID optimizer AGI appears in the active dialplan ($active_dialplan_lines route(s))"
+    if grep -Fq 'agi://127.0.0.1:4578/did_optimizer' <<< "$dialplan_output"; then
+        active_dialplan_lines=$(grep -Fc 'agi://127.0.0.1:4578/did_optimizer' <<< "$dialplan_output")
+        pass "DID optimizer FastAGI appears in the active dialplan ($active_dialplan_lines route(s))"
     else
-        fail 'DID optimizer AGI line not found in the active dialplan'
+        fail 'DID optimizer FastAGI line not found in the active dialplan'
     fi
 else
     fail 'Asterisk CLI is unavailable; active dialplan was not checked'
@@ -265,13 +296,13 @@ fi
 # Search all persistent Asterisk .conf files without assuming a context or
 # extension pattern. Commented examples do not count as installed routes.
 persistent_dialplan_lines=$(grep -RhsE --include='*.conf' \
-    '^[[:space:]]*(same|exten)[[:space:]]*=>.*AGI\(did_optimizer\.agi' \
+    '^[[:space:]]*(same|exten)[[:space:]]*=>.*agi://127\.0\.0\.1:4578/did_optimizer' \
     /etc/asterisk 2>/dev/null || true)
 if [[ -n "$persistent_dialplan_lines" ]]; then
     persistent_dialplan_count=$(grep -c . <<< "$persistent_dialplan_lines")
-    pass "DID optimizer AGI appears in persistent dialplan configuration ($persistent_dialplan_count route(s))"
+    pass "DID optimizer FastAGI appears in persistent dialplan configuration ($persistent_dialplan_count route(s))"
 else
-    fail 'DID optimizer AGI line not found in persistent /etc/asterisk/*.conf files'
+    fail 'DID optimizer FastAGI line not found in persistent /etc/asterisk/*.conf files'
 fi
 
 printf '%s\n' '========================'
