@@ -96,7 +96,7 @@ else
 fi
 
 install_database() {
-    local geo_csv geo_count geo_schema_ready
+    local geo_csv geo_count geo_schema_ready assignment_identity_columns
     require_command mysql
     require_command unzip
     require_command mktemp
@@ -180,6 +180,26 @@ install_database() {
         mysql --protocol=socket --database="$DB_NAME" -e \
             "ALTER TABLE did_optimizer_assignments
                ADD KEY idx_didopt_assignment_server (server_ip, assigned_at);"
+    fi
+
+    # Asterisk unique IDs are local to a dialer node unless the installation
+    # explicitly prefixes them. Scope optimizer idempotency by server so two
+    # cluster nodes can safely produce the same raw unique ID.
+    assignment_identity_columns=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
+        "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',')
+           FROM information_schema.STATISTICS
+          WHERE TABLE_SCHEMA='$DB_NAME'
+            AND TABLE_NAME='did_optimizer_assignments'
+            AND INDEX_NAME='uq_didopt_assignment_call';")
+    if [[ -z "$assignment_identity_columns" ]]; then
+        mysql --protocol=socket --database="$DB_NAME" -e \
+            "ALTER TABLE did_optimizer_assignments
+               ADD UNIQUE KEY uq_didopt_assignment_call (server_ip, unique_call_id);"
+    elif [[ "$assignment_identity_columns" != 'server_ip,unique_call_id' ]]; then
+        mysql --protocol=socket --database="$DB_NAME" -e \
+            "ALTER TABLE did_optimizer_assignments
+               DROP INDEX uq_didopt_assignment_call,
+               ADD UNIQUE KEY uq_didopt_assignment_call (server_ip, unique_call_id);"
     fi
 
     # Expand the early minimal reputation cache without discarding cached data.

@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS did_optimizer_assignments (
     callerid_applied ENUM('Y','N') NOT NULL DEFAULT 'N',
     assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (assignment_id),
-    UNIQUE KEY uq_didopt_assignment_call (unique_call_id),
+    UNIQUE KEY uq_didopt_assignment_call (server_ip, unique_call_id),
     KEY idx_didopt_assignment_campaign_recent
         (campaign_id, assigned_at, assignment_id),
     KEY idx_didopt_assignment_did_recent
