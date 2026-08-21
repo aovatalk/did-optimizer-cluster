@@ -26,6 +26,7 @@ my $FASTAGI_LISTEN      = '127.0.0.1';
 my $FASTAGI_PORT        = 4578;
 my $FASTAGI_WORKERS     = 16;
 my $MAX_SAMPLE_SIZE     = 20;
+my $DID_COOLDOWN_SECONDS = 30;
 my $MIN_SUCCESS_DURATION = 5; # A successful call must be strictly greater than this.
 my $BAYES_PRIOR_STRENGTH = 5;
 my $DURATION_SCORE_CAP   = 120; # Durations at or above this many seconds receive full credit.
@@ -314,12 +315,16 @@ sub get_candidate_dids {
            AND r.checked_at >= (NOW() - INTERVAL 15 MINUTE)
          WHERE p.campaign_id = ?
            AND p.enabled = 'Y'
+           AND (p.last_used IS NULL OR
+                DATE_ADD(p.last_used, INTERVAL ? SECOND) <= NOW())
            AND (p.daily_limit = 0 OR
                 CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END < p.daily_limit)
          ORDER BY p.did_id
     };
     $sql .= ' FOR UPDATE' if $lock_rows;
-    my $rows = $db->selectall_arrayref($sql, { Slice => {} }, $campaign);
+    my $rows = $db->selectall_arrayref(
+        $sql, { Slice => {} }, $campaign, $DID_COOLDOWN_SECONDS
+    );
 
     my @valid;
     for my $did (@$rows) {
@@ -775,7 +780,8 @@ sub select_and_record {
     # Match the original selector: begin with every eligible campaign DID, then
     # let the geography ranks choose the most-local pool before scoring it.
     my $initial = get_candidate_dids($db, $campaign, 0);
-    abort_request('NO_DID', 'No enabled DID remains below its daily limit') unless @$initial;
+    abort_request('NO_DID', 'No enabled DID is currently eligible after limits and cooldown')
+        unless @$initial;
     my @initial_numbers = map { $_->{'did_number'} } @$initial;
     my $geo_profiles = get_geo_profiles($db, [$call->{'destination'}, @initial_numbers]);
     my $destination_profile = $geo_profiles->{$destination_npanxx};
@@ -875,9 +881,11 @@ sub select_and_record {
          WHERE did_id = ?
            AND campaign_id = ?
            AND enabled = 'Y'
+           AND (last_used IS NULL OR
+                DATE_ADD(last_used, INTERVAL ? SECOND) <= NOW())
            AND (daily_limit = 0 OR
                 CASE WHEN usage_date = CURDATE() THEN calls_today ELSE 0 END < daily_limit)
-    }, undef, $selected->{'did_id'}, $campaign);
+    }, undef, $selected->{'did_id'}, $campaign, $DID_COOLDOWN_SECONDS);
     die 'Selected DID became ineligible during update' unless $updated && $updated == 1;
 
     $db->do(q{

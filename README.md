@@ -124,6 +124,7 @@ The cluster-compatible VICIdial admin page provides:
   (`vicidial_campaign_cid_areacodes`), defaulting to `NORMAL`;
 - simple all-DID import with no area-code filtering or import quantity limit;
 - campaign-wide and per-DID daily limits;
+- a 30-second cooldown before the same DID can be selected again;
 - reputation filtering and cached provider results;
 - Bayesian DID performance scores weighted by good-call rate (40%), human-answer
   rate (24%), average answered duration (16%), and reputation (20%);
@@ -206,8 +207,9 @@ during `sudo ./install_did_optimizer.sh --role database`.
 FastAGI workers keep database connections open and ping them only periodically.
 Raw per-DID performance metrics are cached for 30 seconds, while geography and
 database-version data are cached per worker. Candidate eligibility, reputation
-data, daily limits, LRU order, and the final transactional recheck still run
-against current shared-database state for every call.
+data, the 30-second DID cooldown, daily limits, LRU order, and the final
+transactional recheck still run against current shared-database state for every
+call.
 
 The default service starts 16 workers and accepts a backlog of 256 connections.
 This is a safe starting point, not a guaranteed CPS rating. Traffic near 126
