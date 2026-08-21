@@ -44,7 +44,6 @@ my $persistent_mode = 0;
 my $cached_config;
 my $last_db_ping = 0;
 my $window_functions_supported;
-my $completed_log_has_server_ip;
 my %performance_cache;
 my %geo_profile_cache;
 
@@ -598,28 +597,9 @@ sub prune_performance_cache {
     }
 }
 
-# Detect the completed-call schema once per persistent worker. Older and
-# customized VICIdial installations commonly omit server_ip from vicidial_log.
-sub completed_log_has_server_ip {
-    my ($db) = @_;
-    return $completed_log_has_server_ip
-        if $persistent_mode && defined $completed_log_has_server_ip;
-
-    my ($column_count) = $db->selectrow_array(q{
-        SELECT COUNT(*)
-          FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE()
-           AND TABLE_NAME = 'vicidial_log'
-           AND COLUMN_NAME = 'server_ip'
-    });
-    my $supported = $column_count ? 1 : 0;
-    $completed_log_has_server_ip = $supported if $persistent_mode;
-    return $supported;
-}
-
 # VICIdial-version-specific completed-call mapping is isolated here.
-# Some VICIdial schemas store server_ip in vicidial_log, while others make
-# uniqueid the global primary key and do not have that column.
+# Completed calls are correlated by uniqueid and campaign only. Do not depend
+# on the optional vicidial_log.server_ip column.
 # result status  -> vicidial_log.status
 # duration       -> vicidial_log.length_in_sec
 # human answer   -> campaign status override, then global status definition
@@ -648,9 +628,6 @@ sub get_completed_call_results {
     return \%stats unless @query_dids;
 
     my $placeholders = join(',', ('?') x scalar(@query_dids));
-    my $server_join_sql = completed_log_has_server_ip($db)
-        ? ' AND v.server_ip = a.server_ip'
-        : '';
     my $human_sql = q{
         COALESCE(
             (SELECT vcs.human_answered
@@ -688,7 +665,6 @@ sub get_completed_call_results {
                               JOIN vicidial_log v
                                 ON v.uniqueid = a.unique_call_id
                                AND v.campaign_id = a.campaign_id
-                               $server_join_sql
                              WHERE a.campaign_id = ?
                                AND a.callerid_applied = 'Y'
                                AND a.did_number IN ($placeholders)
@@ -721,7 +697,6 @@ sub get_completed_call_results {
                    JOIN vicidial_log v
                      ON v.uniqueid = a.unique_call_id
                     AND v.campaign_id = a.campaign_id
-                    $server_join_sql
                   WHERE a.campaign_id = ?
                     AND a.callerid_applied = 'Y'
                     AND a.did_number = ?
